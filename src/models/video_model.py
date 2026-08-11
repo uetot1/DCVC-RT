@@ -8,8 +8,8 @@ from torch import nn
 from .common_model import CompressionModel
 from ..layers.layers import SubpelConv2x, DepthConvBlock, \
     ResidualBlockUpsample, ResidualBlockWithStride2
-from ..layers.cuda_inference import CUSTOMIZED_CUDA_INFERENCE, round_and_to_int8, \
-    bias_pixel_shuffle_8, bias_quant
+from ..layers.cuda_inference import round_and_to_int8, bias_pixel_shuffle_8, \
+    bias_quant, should_use_custom_kernel
 
 
 qp_shift = [0, 8, 4]
@@ -66,7 +66,7 @@ class Encoder(nn.Module):
 
     def forward(self, x, ctx, quant_step):
         feature = F.pixel_unshuffle(x, 8)
-        if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
+        if not should_use_custom_kernel(x):
             return self.forward_torch(feature, ctx, quant_step)
         return self.forward_cuda(feature, ctx, quant_step)
 
@@ -109,7 +109,7 @@ class Decoder(nn.Module):
         self.conv2 = nn.Conv2d(g_ch_d, g_ch_d, 1)
 
     def forward(self, x, ctx, quant_step,):
-        if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
+        if not should_use_custom_kernel(x):
             return self.forward_torch(x, ctx, quant_step)
 
         return self.forward_cuda(x, ctx, quant_step)
@@ -141,7 +141,7 @@ class ReconGeneration(nn.Module):
         self.head = nn.Conv2d(g_ch_recon, g_ch_src_d, 1)
 
     def forward(self, x, quant_step):
-        if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
+        if not should_use_custom_kernel(x):
             return self.forward_torch(x, quant_step)
 
         return self.forward_cuda(x, quant_step)
@@ -271,6 +271,14 @@ class DMC(CompressionModel):
     def set_curr_poc(self, poc):
         self.curr_poc = poc
 
+    def detach_dpb(self):
+        """Detach stored reference tensors at a truncated-BPTT boundary."""
+        for reference in self.dpb:
+            if reference.frame is not None:
+                reference.frame = reference.frame.detach()
+            if reference.feature is not None:
+                reference.feature = reference.feature.detach()
+
     def apply_feature_adaptor(self):
         if self.dpb[0].feature is None:
             return self.feature_adaptor_i(F.pixel_unshuffle(self.dpb[0].frame, 8))
@@ -304,6 +312,14 @@ class DMC(CompressionModel):
         Returns:
             Reconstructed frame and differentiable estimated BPP.
         """
+        qp = int(qp)
+        if not 0 <= qp < self.q_encoder.shape[0]:
+            raise ValueError(
+                f"DMC coding QP must be in [0, {self.q_encoder.shape[0] - 1}], got {qp}"
+            )
+        if not self.dpb:
+            raise RuntimeError("DMC DPB is empty; add the reconstructed I-frame first")
+
         q_encoder = self.q_encoder[qp:qp+1, :, :, :]
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]
         q_feature = self.q_feature[qp:qp+1, :, :, :]
@@ -388,6 +404,15 @@ class DMC(CompressionModel):
         y_q_w_0, y_q_w_1, s_w_0, s_w_1, y_hat = \
             self.compress_prior_2x(y, params, self.y_spatial_prior)
 
+        rate_z = self.bit_estimator_z.forward_rate(
+            z_hat_write.to(dtype=z.dtype),
+            qp,
+        ).sum()
+        rate_y = (
+            self.gaussian_encoder.forward_rate(y_q_w_0, s_w_0).sum()
+            + self.gaussian_encoder.forward_rate(y_q_w_1, s_w_1).sum()
+        )
+
         cuda_event_y_ready = torch.cuda.Event()
         cuda_event_y_ready.record()
         feature = self.decoder(y_hat, ctx, q_decoder)
@@ -408,6 +433,7 @@ class DMC(CompressionModel):
         self.add_ref_frame(feature, None)
         return {
             'bit_stream': bit_stream,
+            'estimated_entropy_bits': float((rate_z + rate_y).detach().cpu()),
         }
 
     def decompress(self, bit_stream, sps, qp):

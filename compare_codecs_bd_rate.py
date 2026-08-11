@@ -7,7 +7,12 @@ schema produced by ``evaluate_vcm.py`` or a compact external-result file:
   "method": "HEVC",
   "evaluation_id": "same_dataset_same_frames_v1",
   "task_model": "yolov5s",
-  "protocol": "external seed excluded; all coded P-frames included",
+  "protocol": "all frames and complete bitstream included",
+  "comparison_scope": "end-to-end VCM system",
+  "machine_frontend": {
+    "type": "pretrained_or_trained_frontend",
+    "weights_id": "sha256:..."
+  },
   "points": [
     {
       "rate_label": "QP 37",
@@ -63,12 +68,14 @@ SHARED_METADATA_KEYS = (
     "protocol",
     "ground_truth",
     "detector_config",
+    "comparison_scope",
 )
 REQUIRED_METADATA_KEYS = (
     "method",
     "codec",
     "rate_source",
     *SHARED_METADATA_KEYS,
+    "machine_frontend",
 )
 
 
@@ -191,6 +198,8 @@ def load_method_results(
         "protocol": data.get("protocol"),
         "ground_truth": data.get("ground_truth"),
         "detector_config": data.get("detector_config"),
+        "comparison_scope": data.get("comparison_scope"),
+        "machine_frontend": data.get("machine_frontend"),
         "points": normalized_points,
     }
 
@@ -411,16 +420,21 @@ def write_templates(output_dir: Path) -> None:
                 "weights_id": (
                     "torch-hub:yolov5s:ultralytics/yolov5:v7.0"
                 ),
+                "weights_scope": "pretrained initialization and frozen task backend",
                 "input_size": 640,
                 "confidence_threshold": 0.001,
                 "nms_iou_threshold": 0.6,
                 "max_detections": 300,
                 "feature_repository": "ultralytics/yolov5:v7.0",
             },
-            "protocol": (
-                "external seed excluded; all coded P-frames included"
-            ),
+            "protocol": "all frames and complete bitstream included",
+            "comparison_scope": "end-to-end VCM system",
             "rate_source": "replace_with_actual_bitstream_measurement",
+            "machine_frontend": {
+                "type": "replace_with_pretrained_or_trained_frontend",
+                "weights_id": "replace_with_sha256_or_checkpoint_id",
+                "task_backend": "replace_with_frozen_task_backend",
+            },
             "points": points,
         }
         path = output_dir / f"{method_key}_results_template.json"
@@ -491,6 +505,8 @@ def run_comparison(args: argparse.Namespace) -> None:
                     "protocol",
                     "ground_truth",
                     "detector_config",
+                    "comparison_scope",
+                    "machine_frontend",
                 )
             }
             for result in results

@@ -1,4 +1,10 @@
-"""Simple sequence container for actual DMC P-frame bitstreams."""
+"""Versioned sequence container for actual DMCI + DMC frame bitstreams.
+
+When ``external_seed`` is false, packet 0 is DMCI and all later packets are DMC.
+The deterministic ordering avoids adding a frame-type byte to every packet.
+VCM2 records the DCVC-RT feature-reset interval; the reader remains compatible
+with legacy VCM1 files, which imply no periodic reset.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +14,10 @@ from pathlib import Path
 from typing import BinaryIO, Iterator
 
 
-MAGIC = b"VCM1"
-SEQUENCE_HEADER = struct.Struct(">4sHHfIB")
+LEGACY_MAGIC = b"VCM1"
+MAGIC = b"VCM2"
+LEGACY_SEQUENCE_HEADER = struct.Struct(">4sHHfIB")
+SEQUENCE_HEADER = struct.Struct(">4sHHfIHB")
 FRAME_HEADER = struct.Struct(">BI")
 FLAG_EXTERNAL_SEED = 1
 FLAG_TWO_ENTROPY_CODERS = 2
@@ -23,6 +31,7 @@ class SequenceHeader:
     coded_frames: int
     external_seed: bool
     two_entropy_coders: bool
+    reset_interval: int
 
 
 @dataclass(frozen=True)
@@ -39,13 +48,16 @@ class VCMSequenceWriter:
         height: int,
         fps: float,
         coded_frames: int,
-        external_seed: bool = True,
+        external_seed: bool = False,
         two_entropy_coders: bool = False,
+        reset_interval: int = 0,
     ):
         if not 0 < width < 65536 or not 0 < height < 65536:
             raise ValueError("Sequence dimensions must fit unsigned 16-bit fields")
         if fps <= 0 or coded_frames <= 0:
             raise ValueError("fps and coded_frames must be positive")
+        if not 0 <= reset_interval < 65536:
+            raise ValueError("reset_interval must fit an unsigned 16-bit field")
 
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,6 +75,7 @@ class VCMSequenceWriter:
                 int(height),
                 float(fps),
                 int(coded_frames),
+                int(reset_interval),
                 flags,
             )
         )
@@ -100,11 +113,31 @@ class VCMSequenceReader:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.file: BinaryIO = self.path.open("rb")
-        raw_header = self.file.read(SEQUENCE_HEADER.size)
-        if len(raw_header) != SEQUENCE_HEADER.size:
+        magic = self.file.read(4)
+        if len(magic) != 4:
             raise ValueError(f"Truncated sequence header: {self.path}")
-        magic, width, height, fps, coded_frames, flags = SEQUENCE_HEADER.unpack(raw_header)
-        if magic != MAGIC:
+        if magic == MAGIC:
+            raw_header = magic + self.file.read(SEQUENCE_HEADER.size - 4)
+            if len(raw_header) != SEQUENCE_HEADER.size:
+                raise ValueError(f"Truncated sequence header: {self.path}")
+            (
+                _,
+                width,
+                height,
+                fps,
+                coded_frames,
+                reset_interval,
+                flags,
+            ) = SEQUENCE_HEADER.unpack(raw_header)
+        elif magic == LEGACY_MAGIC:
+            raw_header = magic + self.file.read(LEGACY_SEQUENCE_HEADER.size - 4)
+            if len(raw_header) != LEGACY_SEQUENCE_HEADER.size:
+                raise ValueError(f"Truncated sequence header: {self.path}")
+            _, width, height, fps, coded_frames, flags = LEGACY_SEQUENCE_HEADER.unpack(
+                raw_header
+            )
+            reset_interval = 0
+        else:
             raise ValueError(f"Invalid VCM bitstream magic in {self.path}")
         self.header = SequenceHeader(
             width=width,
@@ -113,6 +146,7 @@ class VCMSequenceReader:
             coded_frames=coded_frames,
             external_seed=bool(flags & FLAG_EXTERNAL_SEED),
             two_entropy_coders=bool(flags & FLAG_TWO_ENTROPY_CODERS),
+            reset_interval=reset_interval,
         )
 
     def frames(self) -> Iterator[FramePacket]:

@@ -7,20 +7,41 @@ import torch
 import torch.nn.functional as F
 
 
+def _environment_flag(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# The fused extension is inference-only. Training sets DCVC_FORCE_TORCH before
+# importing the codec, and should_use_custom_kernel() is a second guard for any
+# caller that imports the model before setting that environment variable.
+FORCE_TORCH_PATH = _environment_flag("DCVC_FORCE_TORCH")
 CUSTOMIZED_CUDA_INFERENCE = False
-try:
-    from inference_extensions_cuda import process_with_mask_cuda, combine_for_reading_2x_cuda, \
-        restore_y_2x_cuda, restore_y_4x_cuda, build_index_dec_cuda, \
-        round_and_to_int8_cuda, clamp_reciprocal_with_quant_cuda, bias_quant_cuda, \
-        add_and_multiply_cuda, bias_pixel_shuffle_8_cuda, replicate_pad_cuda, \
-        build_index_enc_cuda, DepthConvProxy, SubpelConv2xProxy  # noqa: F401
-    CUSTOMIZED_CUDA_INFERENCE = True
-except Exception:  # pylint: disable=W0718
-    pass
+if not FORCE_TORCH_PATH:
+    try:
+        from inference_extensions_cuda import process_with_mask_cuda, combine_for_reading_2x_cuda, \
+            restore_y_2x_cuda, restore_y_4x_cuda, build_index_dec_cuda, \
+            round_and_to_int8_cuda, clamp_reciprocal_with_quant_cuda, bias_quant_cuda, \
+            add_and_multiply_cuda, bias_pixel_shuffle_8_cuda, replicate_pad_cuda, \
+            build_index_enc_cuda, DepthConvProxy, SubpelConv2xProxy  # noqa: F401
+        CUSTOMIZED_CUDA_INFERENCE = True
+    except Exception:  # pylint: disable=W0718
+        pass
 
 
 if not CUSTOMIZED_CUDA_INFERENCE and 'SUPPRESS_CUSTOM_KERNEL_WARNING' not in os.environ:
-    print("cannot import cuda implementation for inference, fallback to pytorch.")
+    if FORCE_TORCH_PATH:
+        print("custom CUDA inference disabled; using autograd-safe PyTorch path.")
+    else:
+        print("cannot import cuda implementation for inference, fallback to pytorch.")
+
+
+def should_use_custom_kernel(*tensors):
+    """Return true only for CUDA inference with autograd globally disabled."""
+    return (
+        CUSTOMIZED_CUDA_INFERENCE
+        and not torch.is_grad_enabled()
+        and all(tensor.is_cuda for tensor in tensors)
+    )
 
 
 def round_and_to_int8(z):
@@ -31,7 +52,7 @@ def round_and_to_int8(z):
         z_hat_write = z_hat.to(dtype=torch.int8) # Không backprop qua biến này
         return z_hat, z_hat_write
 
-    if CUSTOMIZED_CUDA_INFERENCE and z.is_cuda:
+    if should_use_custom_kernel(z):
         z_int8 = round_and_to_int8_cuda(z)
         return z, z_int8
 
@@ -41,7 +62,7 @@ def round_and_to_int8(z):
 
 
 def clamp_reciprocal_with_quant(q_dec, y, min_val):
-    if CUSTOMIZED_CUDA_INFERENCE and q_dec.is_cuda:
+    if should_use_custom_kernel(q_dec, y):
         # q_dec is not inplace modified at decoder side
         q_dec = clamp_reciprocal_with_quant_cuda(q_dec, y, min_val)
         return q_dec, y
@@ -53,7 +74,7 @@ def clamp_reciprocal_with_quant(q_dec, y, min_val):
 
 
 def add_and_multiply(y_hat_0, y_hat_1, q_dec):
-    if CUSTOMIZED_CUDA_INFERENCE and y_hat_0.is_cuda:
+    if should_use_custom_kernel(y_hat_0, y_hat_1, q_dec):
         add_and_multiply_cuda(y_hat_0, y_hat_1, q_dec)
         return y_hat_0
 
@@ -63,7 +84,7 @@ def add_and_multiply(y_hat_0, y_hat_1, q_dec):
 
 
 def process_with_mask(y, scales, means, mask, force_zero_thres):
-    if not y.requires_grad and CUSTOMIZED_CUDA_INFERENCE and y.is_cuda:
+    if should_use_custom_kernel(y, scales, means, mask):
         thres = force_zero_thres if force_zero_thres is not None else -1.
         return process_with_mask_cuda(y, scales, means, mask, thres)
 
@@ -71,7 +92,7 @@ def process_with_mask(y, scales, means, mask, force_zero_thres):
     means_hat = means * mask
 
     y_res = (y - means_hat) * mask
-    
+
     if y.requires_grad:
         # [TRAINING MODE] Thêm nhiễu Uniform
         noise = torch.empty_like(y_res).uniform_(-0.5, 0.5)
@@ -79,7 +100,7 @@ def process_with_mask(y, scales, means, mask, force_zero_thres):
     else:
         # [INFERENCE MODE] Dùng hàm làm tròn
         y_q = torch.round(y_res)
-        
+
     if force_zero_thres is not None:
         cond = scales_hat > force_zero_thres
         y_q = y_q * cond
@@ -90,7 +111,7 @@ def process_with_mask(y, scales, means, mask, force_zero_thres):
 
 
 def combine_for_reading_2x(x, mask, inplace=False):
-    if CUSTOMIZED_CUDA_INFERENCE and x.is_cuda and x.is_contiguous():
+    if should_use_custom_kernel(x, mask) and x.is_contiguous():
         B, C, H, W = x.shape
         if inplace:
             out = x[:, :C // 2, :, :]
@@ -105,7 +126,7 @@ def combine_for_reading_2x(x, mask, inplace=False):
 
 
 def restore_y_2x(y, means, mask):
-    if CUSTOMIZED_CUDA_INFERENCE and y.is_cuda and y.is_contiguous():
+    if should_use_custom_kernel(y, means, mask) and y.is_contiguous():
         out = torch.empty_like(means)
         restore_y_2x_cuda(out, y, means, mask)
         return out
@@ -114,7 +135,7 @@ def restore_y_2x(y, means, mask):
 
 
 def restore_y_2x_with_cat_after(y, means, mask, to_cat):
-    if CUSTOMIZED_CUDA_INFERENCE and y.is_cuda and y.is_contiguous():
+    if should_use_custom_kernel(y, means, mask, to_cat) and y.is_contiguous():
         B, C1, H, W = means.shape
         C2 = to_cat.shape[1]
         out = torch.empty((B, C1 + C2, H, W), dtype=means.dtype, layout=means.layout,
@@ -128,7 +149,7 @@ def restore_y_2x_with_cat_after(y, means, mask, to_cat):
 
 
 def restore_y_4x(y, means, mask):
-    if CUSTOMIZED_CUDA_INFERENCE and y.is_cuda and y.is_contiguous():
+    if should_use_custom_kernel(y, means, mask) and y.is_contiguous():
         out = torch.empty_like(means)
         restore_y_4x_cuda(out, y, means, mask)
         return out
@@ -137,7 +158,7 @@ def restore_y_4x(y, means, mask):
 
 
 def build_index_dec(scales, scale_min, scale_max, log_scale_min, log_step_recip, skip_thres=None):
-    if CUSTOMIZED_CUDA_INFERENCE and scales.is_cuda:
+    if should_use_custom_kernel(scales):
         out = torch.empty_like(scales, dtype=torch.uint8)
         skip_cond = None
         if skip_thres is not None:
@@ -160,7 +181,7 @@ def build_index_dec(scales, scale_min, scale_max, log_scale_min, log_step_recip,
 
 def build_index_enc(symbols, scales, scale_min, scale_max, log_scale_min,
                     log_step_recip, skip_thres=None):
-    if CUSTOMIZED_CUDA_INFERENCE and scales.is_cuda:
+    if should_use_custom_kernel(symbols, scales):
         out = torch.empty_like(scales, dtype=torch.int16)
         skip_cond = None
         if skip_thres is not None:
@@ -189,13 +210,13 @@ def build_index_enc(symbols, scales, scale_min, scale_max, log_scale_min,
 def replicate_pad(x, pad_b, pad_r):
     if pad_b == 0 and pad_r == 0:
         return x
-    if CUSTOMIZED_CUDA_INFERENCE and x.is_cuda:
+    if should_use_custom_kernel(x):
         return replicate_pad_cuda(x, pad_b, pad_r)
     return F.pad(x, (0, pad_r, 0, pad_b), mode="replicate")
 
 
 def bias_pixel_shuffle_8(x, bias):
-    if CUSTOMIZED_CUDA_INFERENCE and x.is_cuda:
+    if should_use_custom_kernel(x, bias):
         B, C, H, W = x.shape
         assert B == 1
         out = torch.empty((B, 3, H * 8, W * 8), dtype=x.dtype, device=x.device, layout=x.layout)
@@ -209,7 +230,7 @@ def bias_pixel_shuffle_8(x, bias):
 
 
 def bias_quant(x, bias, quant_step):
-    if CUSTOMIZED_CUDA_INFERENCE and x.is_cuda:
+    if should_use_custom_kernel(x, bias, quant_step):
         bias_quant_cuda(x, bias, quant_step)
         return x
 

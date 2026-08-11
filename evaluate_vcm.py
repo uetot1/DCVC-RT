@@ -1,9 +1,9 @@
-"""WG2-style machine-task evaluation for the P-frame-only DCVC-RT VCM codec.
+"""All-frame machine-task evaluation for DCVC-RT and the proposed VCM codec.
 
 Training remains differentiable and uses ``DMC.forward_train``. This script is
-evaluation-only: it uses ``DMC.compress`` and ``DMC.decompress`` to measure
-actual sequence-container bytes, then measures detector mAP against real
-ground-truth labels at four rate points.
+evaluation-only: frozen DMCI codes frame 0, DMC codes all P-frames, and actual
+sequence-container bytes include both. Reconstructed BT.709 YCbCr is converted
+to RGB before measuring detector mAP against real labels at four rate points.
 """
 
 from __future__ import annotations
@@ -20,30 +20,57 @@ from torch.nn import functional as F
 from torchvision.transforms import functional as transforms
 from tqdm import tqdm
 
+from src.models.image_model import DMCI
 from src.models.video_model import DMC
-from src.models.yolov5_extractor import install_cloned_backbone, load_yolov5
+from src.models.yolov5_extractor import install_cloned_frontend, load_yolov5
 from src.utils.bd_rate import compute_bd_metric, compute_bd_rate, pareto_front
 from src.utils.detection_map import DetectionMAP
 from src.utils.evaluation_protocol import (
-    EXTERNAL_SEED_PROTOCOL,
+    ALL_FRAMES_PROTOCOL,
     dataset_summary,
     detector_config,
     evaluation_id,
+    state_dict_sha256,
 )
-from src.utils.vcm_bitstream import VCMSequenceReader, VCMSequenceWriter
+from src.utils.vcm_bitstream import FRAME_HEADER, VCMSequenceReader, VCMSequenceWriter
 from src.utils.vcm_eval_dataset import AnnotatedVideoDataset, VideoSequence
+from src.utils.transforms import rgb2ycbcr, ycbcr2rgb
 
 
 QP_OFFSETS = (0, 8, 0, 4, 0, 4, 0, 4)
 RATE_POINT_COUNT = 4
+TWO_ENTROPY_CODER_PIXEL_THRESHOLD = 1280 * 720
+TEMPORAL_BIN_ORDER = (
+    "frame_0",
+    "frames_1_7",
+    "frames_8_31",
+    "frames_32_63",
+    "frames_64_plus",
+)
 
 
-def load_codec_checkpoint(model: DMC, path: str | Path) -> dict:
-    """Load DMC weights and return metadata needed by the machine front end."""
+def temporal_bin_name(frame_index: int) -> str:
+    """Map a zero-based frame index to the long-sequence diagnostic bins."""
+    frame_index = int(frame_index)
+    if frame_index < 0:
+        raise ValueError("frame_index must be non-negative")
+    if frame_index == 0:
+        return "frame_0"
+    if frame_index <= 7:
+        return "frames_1_7"
+    if frame_index <= 31:
+        return "frames_8_31"
+    if frame_index <= 63:
+        return "frames_32_63"
+    return "frames_64_plus"
+
+
+def load_codec_checkpoint(model, path: str | Path, state_key: str | None = None) -> dict:
+    """Load official or project checkpoint weights and return its metadata."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(checkpoint, dict):
         state = checkpoint.get(
-            "dmc_state_dict",
+            state_key or "dmc_state_dict",
             checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint)),
         )
     else:
@@ -58,12 +85,13 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "method"
 
 
-def pad_frame(frame: torch.Tensor, model: DMC, device: torch.device) -> torch.Tensor:
-    frame = frame.unsqueeze(0).to(device, non_blocking=True)
+def pad_frame(frame: torch.Tensor, model, device: torch.device) -> torch.Tensor:
+    dtype = next(model.parameters()).dtype
+    frame = frame.unsqueeze(0).to(device=device, dtype=dtype, non_blocking=True)
     padding_right, padding_bottom = model.get_padding_size(
         frame.shape[-2],
         frame.shape[-1],
-        64,
+        16,
     )
     return F.pad(frame, (0, padding_right, 0, padding_bottom), mode="replicate")
 
@@ -84,44 +112,64 @@ def coding_qp(base_qp: int, frame_index: int) -> int:
     return base_qp + QP_OFFSETS[frame_index % len(QP_OFFSETS)]
 
 
+def use_two_entropy_coders(width: int, height: int) -> bool:
+    return width * height > TWO_ENTROPY_CODER_PIXEL_THRESHOLD
+
+
 @torch.inference_mode()
 def encode_sequence(
+    image_model: DMCI,
     model: DMC,
     dataset: AnnotatedVideoDataset,
     sequence: VideoSequence,
     base_qp: int,
     output_path: Path,
     device: torch.device,
-) -> None:
-    """Encode P-frames to a real entropy-coded sequence container."""
+    reset_interval: int,
+) -> list[float]:
+    """Encode one DMCI I-frame and every following DMC P-frame."""
+    two_entropy_coders = use_two_entropy_coders(sequence.width, sequence.height)
+    image_model.set_use_two_entropy_coders(two_entropy_coders)
+    model.set_use_two_entropy_coders(two_entropy_coders)
     model.clear_dpb()
     model.set_curr_poc(0)
-    seed = pad_frame(dataset.load_frame(sequence.frame_paths[0]), model, device)
-    model.add_ref_frame(feature=None, frame=seed)
+    seed_rgb = pad_frame(dataset.load_frame(sequence.frame_paths[0]), image_model, device)
+    encoded_i = image_model.compress(rgb2ycbcr(seed_rgb), base_qp)
+    model.add_ref_frame(feature=None, frame=encoded_i["x_hat"])
+    estimated_entropy_bits = [float(encoded_i["estimated_entropy_bits"])]
 
     with VCMSequenceWriter(
         output_path,
         width=sequence.width,
         height=sequence.height,
         fps=sequence.fps,
-        coded_frames=sequence.frame_count - 1,
-        external_seed=True,
-        two_entropy_coders=False,
+        coded_frames=sequence.frame_count,
+        external_seed=False,
+        two_entropy_coders=two_entropy_coders,
+        reset_interval=reset_interval,
     ) as writer:
+        writer.write_frame(base_qp, encoded_i["bit_stream"])
+        last_qp = 0
         for frame_index in range(1, sequence.frame_count):
-            frame = pad_frame(
+            frame_rgb = pad_frame(
                 dataset.load_frame(sequence.frame_paths[frame_index]),
                 model,
                 device,
             )
+            if reset_interval > 0 and frame_index % reset_interval == 1:
+                model.prepare_feature_adaptor_i(last_qp)
             qp = coding_qp(base_qp, frame_index)
-            encoded = model.compress(frame, qp)
+            encoded = model.compress(rgb2ycbcr(frame_rgb), qp)
             writer.write_frame(qp, encoded["bit_stream"])
+            estimated_entropy_bits.append(float(encoded["estimated_entropy_bits"]))
+            last_qp = qp
     torch.cuda.synchronize(device)
+    return estimated_entropy_bits
 
 
 @torch.inference_mode()
 def decode_and_evaluate_sequence(
+    image_model: DMCI,
     model: DMC,
     detector,
     evaluator: DetectionMAP,
@@ -132,21 +180,19 @@ def decode_and_evaluate_sequence(
     detector_size: int,
     first_image_id: int,
     reconstruction_dir: Path | None,
+    temporal_evaluators: dict[str, DetectionMAP] | None = None,
 ) -> int:
     """Decode a sequence and add ground-truth detection results to mAP."""
     model.clear_dpb()
     model.set_curr_poc(0)
-    seed = pad_frame(dataset.load_frame(sequence.frame_paths[0]), model, device)
-    model.add_ref_frame(feature=None, frame=seed)
-
     with VCMSequenceReader(bitstream_path) as reader:
         header = reader.header
         if (header.width, header.height) != (sequence.width, sequence.height):
             raise ValueError(f"Bitstream resolution mismatch for {sequence.name}")
-        if header.coded_frames != sequence.frame_count - 1:
+        if header.coded_frames != sequence.frame_count:
             raise ValueError(f"Bitstream frame-count mismatch for {sequence.name}")
-        if not header.external_seed:
-            raise ValueError("This project requires the external-seed P-frame protocol")
+        if header.external_seed:
+            raise ValueError("All-frame evaluation requires a coded DMCI I-frame")
 
         sps = {
             "height": sequence.height,
@@ -155,14 +201,24 @@ def decode_and_evaluate_sequence(
             "use_ada_i": 0,
         }
         image_id = first_image_id
-        for frame_index, packet in enumerate(reader.frames(), start=1):
-            decoded = model.decompress(packet.bitstream, sps, packet.qp)
-            reconstructed = decoded["x_hat"][
+        for frame_index, packet in enumerate(reader.frames()):
+            if frame_index == 0:
+                decoded = image_model.decompress(packet.bitstream, sps, packet.qp)
+                model.add_ref_frame(feature=None, frame=decoded["x_hat"])
+            else:
+                if (
+                    header.reset_interval > 0
+                    and frame_index % header.reset_interval == 1
+                ):
+                    model.reset_ref_feature()
+                decoded = model.decompress(packet.bitstream, sps, packet.qp)
+            reconstructed_ycbcr = decoded["x_hat"][
                 :,
                 :,
                 : sequence.height,
                 : sequence.width,
             ]
+            reconstructed = ycbcr2rgb(reconstructed_ycbcr)
             detections = detector(
                 [as_yolo_image(reconstructed)],
                 size=detector_size,
@@ -187,6 +243,15 @@ def decode_and_evaluate_sequence(
                 target_boxes=target_boxes,
                 target_classes=target_classes,
             )
+            if temporal_evaluators is not None:
+                temporal_evaluators[temporal_bin_name(frame_index)].add(
+                    image_id=image_id,
+                    predicted_boxes=detections[:, :4],
+                    predicted_scores=detections[:, 4],
+                    predicted_classes=detections[:, 5].long(),
+                    target_boxes=target_boxes,
+                    target_classes=target_classes,
+                )
 
             if reconstruction_dir is not None:
                 output_path = (
@@ -205,25 +270,83 @@ def decode_and_evaluate_sequence(
 def sequence_rate_record(
     sequence: VideoSequence,
     bitstream_path: Path,
-) -> dict[str, float | int | str]:
-    coded_frames = sequence.frame_count - 1
+    estimated_entropy_bits_by_frame: list[float],
+) -> dict:
+    coded_frames = sequence.frame_count
     actual_bits = bitstream_path.stat().st_size * 8
+    if len(estimated_entropy_bits_by_frame) != coded_frames:
+        raise ValueError(
+            f"Estimated-rate frame count mismatch for {sequence.name}: "
+            f"{len(estimated_entropy_bits_by_frame)} != {coded_frames}"
+        )
+    actual_bits_by_frame = container_bits_by_frame(bitstream_path)
+    if len(actual_bits_by_frame) != coded_frames:
+        raise ValueError(f"Container frame count mismatch for {sequence.name}")
+    estimated_entropy_bits = float(sum(estimated_entropy_bits_by_frame))
     total_pixels = coded_frames * sequence.width * sequence.height
+    if estimated_entropy_bits <= 0:
+        raise ValueError(f"Non-positive estimated entropy rate for {sequence.name}")
+    temporal_bins: dict[str, dict[str, float | int]] = {}
+    pixels_per_frame = sequence.width * sequence.height
+    for frame_index, (frame_actual_bits, frame_estimated_bits) in enumerate(
+        zip(actual_bits_by_frame, estimated_entropy_bits_by_frame, strict=True)
+    ):
+        name = temporal_bin_name(frame_index)
+        entry = temporal_bins.setdefault(
+            name,
+            {
+                "actual_bits": 0,
+                "estimated_entropy_bits": 0.0,
+                "pixels": 0,
+                "coded_frames": 0,
+            },
+        )
+        entry["actual_bits"] += int(frame_actual_bits)
+        entry["estimated_entropy_bits"] += float(frame_estimated_bits)
+        entry["pixels"] += pixels_per_frame
+        entry["coded_frames"] += 1
+
     return {
         "name": sequence.name,
         "bitstream_file": str(bitstream_path),
         "actual_bits": actual_bits,
         "actual_bpp": actual_bits / total_pixels,
+        "estimated_entropy_bits": float(estimated_entropy_bits),
+        "estimated_bpp": float(estimated_entropy_bits / total_pixels),
+        "actual_to_estimated_bpp_ratio": float(actual_bits / estimated_entropy_bits),
+        "actual_minus_estimated_bits": float(actual_bits - estimated_entropy_bits),
         "kbps": actual_bits * sequence.fps / (1000.0 * coded_frames),
         "fps": sequence.fps,
         "width": sequence.width,
         "height": sequence.height,
         "coded_frames": coded_frames,
+        "temporal_bins": temporal_bins,
     }
+
+
+def container_bits_by_frame(bitstream_path: Path) -> list[int]:
+    """Return exact container bits per frame, assigning sequence header to I."""
+    with VCMSequenceReader(bitstream_path) as reader:
+        sequence_header_bits = reader.file.tell() * 8
+        frame_bits = [
+            (FRAME_HEADER.size + len(packet.bitstream)) * 8
+            for packet in reader.frames()
+        ]
+    if not frame_bits:
+        raise ValueError(f"Container has no coded frames: {bitstream_path}")
+    frame_bits[0] += sequence_header_bits
+    if sum(frame_bits) != bitstream_path.stat().st_size * 8:
+        raise RuntimeError(f"Per-frame container accounting failed: {bitstream_path}")
+    return frame_bits
 
 
 def aggregate_rate(sequence_records: list[dict]) -> dict[str, float | int]:
     total_bits = sum(record["actual_bits"] for record in sequence_records)
+    estimated_entropy_bits = sum(
+        record["estimated_entropy_bits"] for record in sequence_records
+    )
+    if estimated_entropy_bits <= 0:
+        raise ValueError("Aggregate estimated entropy rate must be positive")
     total_pixels = sum(
         record["coded_frames"] * record["width"] * record["height"]
         for record in sequence_records
@@ -234,11 +357,76 @@ def aggregate_rate(sequence_records: list[dict]) -> dict[str, float | int]:
     return {
         "actual_bits": int(total_bits),
         "actual_bpp": float(total_bits / total_pixels),
+        "estimated_entropy_bits": float(estimated_entropy_bits),
+        "estimated_bpp": float(estimated_entropy_bits / total_pixels),
+        "actual_to_estimated_bpp_ratio": float(total_bits / estimated_entropy_bits),
+        "actual_minus_estimated_bits": float(total_bits - estimated_entropy_bits),
         "kbps": float(total_bits / total_duration / 1000.0),
         "coded_frames": int(
             sum(record["coded_frames"] for record in sequence_records)
         ),
     }
+
+
+def aggregate_temporal_rate(sequence_records: list[dict]) -> dict[str, dict]:
+    totals: dict[str, dict[str, float | int]] = {}
+    for record in sequence_records:
+        for name, values in record["temporal_bins"].items():
+            entry = totals.setdefault(
+                name,
+                {
+                    "actual_bits": 0,
+                    "estimated_entropy_bits": 0.0,
+                    "pixels": 0,
+                    "coded_frames": 0,
+                },
+            )
+            for key in entry:
+                entry[key] += values[key]
+
+    rates = {}
+    for name in TEMPORAL_BIN_ORDER:
+        if name not in totals:
+            continue
+        entry = totals[name]
+        estimated = float(entry["estimated_entropy_bits"])
+        pixels = int(entry["pixels"])
+        actual = int(entry["actual_bits"])
+        rates[name] = {
+            **entry,
+            "actual_bpp": float(actual / pixels),
+            "estimated_bpp": float(estimated / pixels),
+            "actual_to_estimated_bpp_ratio": (
+                float(actual / estimated) if estimated > 0 else None
+            ),
+        }
+    return rates
+
+
+def temporal_diagnostics(
+    rates: dict[str, dict],
+    evaluators: dict[str, DetectionMAP],
+) -> dict[str, dict]:
+    diagnostics = {}
+    for name in TEMPORAL_BIN_ORDER:
+        if name not in rates:
+            continue
+        evaluator = evaluators[name]
+        record = dict(rates[name])
+        if evaluator.image_ids and evaluator.ground_truth:
+            record.update(evaluator.compute())
+            record["status"] = "ok"
+        else:
+            record.update(
+                {
+                    "evaluated_images": len(evaluator.image_ids),
+                    "map50": None,
+                    "map5095": None,
+                    "status": "no_ground_truth_objects",
+                }
+            )
+        diagnostics[name] = record
+    return diagnostics
 
 
 def evaluate_codec(args: argparse.Namespace) -> None:
@@ -257,22 +445,46 @@ def evaluate_codec(args: argparse.Namespace) -> None:
         sequences = sequences[: args.max_sequences]
     if not sequences:
         raise RuntimeError("No evaluation sequences were selected")
+    short_sequences = [
+        sequence.name
+        for sequence in sequences
+        if sequence.frame_count < args.minimum_sequence_frames
+    ]
+    if short_sequences:
+        raise ValueError(
+            f"{len(short_sequences)} selected sequences have fewer than "
+            f"--minimum-sequence-frames={args.minimum_sequence_frames}; "
+            f"first: {short_sequences[0]}"
+        )
 
+    image_model = DMCI().to(device).eval()
+    load_codec_checkpoint(image_model, args.image_ckpt, state_key="dmci_state_dict")
     model = DMC().to(device).eval()
     checkpoint = load_codec_checkpoint(model, args.video_ckpt)
     try:
+        image_model.update(force_zero_thres=args.force_zero_thres)
         model.update(force_zero_thres=args.force_zero_thres)
     except ImportError as error:
         raise RuntimeError(
             "Actual bitstream evaluation requires the MLCodec_extensions_cpp "
             "entropy-coder extension. Build src/cpp first."
         ) from error
-    model.set_use_two_entropy_coders(False)
+    if args.codec_precision == "fp16":
+        image_model.half()
+        model.half()
 
     detector = load_yolov5(
         args.task_model,
         repository=args.yolov5_repo,
         weights=args.yolov5_weights,
+    )
+    detector_metadata = detector_config(
+        args.task_model,
+        args.detector_size,
+        args.confidence_threshold,
+        args.nms_iou_threshold,
+        args.max_detections,
+        args.yolov5_weights,
     )
     feature_objective = checkpoint.get("feature_objective", {})
     cloned_frontend_state = checkpoint.get("cloned_frontend_state_dict")
@@ -283,26 +495,43 @@ def evaluate_codec(args: argparse.Namespace) -> None:
                 "Checkpoint cloned front end was trained for "
                 f"{trained_task_model}, not --task-model {args.task_model}"
             )
-        last_backbone_layer = feature_objective.get("last_backbone_layer")
-        if last_backbone_layer is None:
-            last_backbone_layer = max(
+        trained_backend_weights = checkpoint.get("source_checkpoints", {}).get(
+            "yolov5_weights_sha256"
+        )
+        if (
+            trained_backend_weights is not None
+            and trained_backend_weights != detector_metadata["weights_id"]
+        ):
+            raise ValueError(
+                "Evaluation must use the same frozen YOLOv5 weights as training: "
+                f"checkpoint={trained_backend_weights}, "
+                f"evaluation={detector_metadata['weights_id']}"
+            )
+        last_frontend_layer = feature_objective.get(
+            "cloned_frontend_last_layer"
+        )
+        if last_frontend_layer is None:
+            last_frontend_layer = feature_objective.get("last_backbone_layer")
+        if last_frontend_layer is None:
+            last_frontend_layer = max(
                 int(key.split(".", 1)[0]) for key in cloned_frontend_state
             )
-        last_backbone_layer = int(last_backbone_layer)
-        install_cloned_backbone(
+        last_frontend_layer = int(last_frontend_layer)
+        install_cloned_frontend(
             detector,
             cloned_frontend_state,
-            last_backbone_layer,
+            last_frontend_layer,
         )
         machine_frontend = {
             "type": "checkpoint_cloned_yolov5_frontend",
+            "weights_id": state_dict_sha256(cloned_frontend_state),
             "trainable_during_codec_training": bool(
                 checkpoint.get("optimizer_config", {}).get(
                     "train_cloned_frontend",
                     False,
                 )
             ),
-            "last_backbone_layer": last_backbone_layer,
+            "last_frontend_layer": last_frontend_layer,
             "feature_layer_indices": list(
                 feature_objective.get("layer_indices", ())
             ),
@@ -310,23 +539,30 @@ def evaluate_codec(args: argparse.Namespace) -> None:
                 "normalized_layer_weights"
             ),
             "task_backend": "frozen_pretrained_yolov5",
+            "task_backend_weights_id": detector_metadata["weights_id"],
+            "feature_topology": feature_objective.get("topology"),
         }
         print(
             "Evaluation detector uses the trained cloned YOLO front end "
-            f"(layers 0..{last_backbone_layer}) and frozen task back end."
+            f"(layers 0..{last_frontend_layer}) and frozen task back end."
         )
     else:
         machine_frontend = {
             "type": "pretrained_yolov5_frontend",
+            "weights_id": detector_metadata["weights_id"],
             "trainable_during_codec_training": False,
             "task_backend": "frozen_pretrained_yolov5",
-            "legacy_checkpoint_without_clone": True,
+            "task_backend_weights_id": detector_metadata["weights_id"],
+            "checkpoint_without_clone": True,
+            "evaluation_role": "pretrained_frontend_anchor",
         }
         print(
             "Checkpoint has no cloned YOLO front end; evaluation falls back "
-            "to the pretrained detector (legacy/frozen-feature protocol)."
+            "to the pretrained detector (anchor/frozen-feature protocol)."
         )
     detector = detector.to(device).eval()
+    for parameter in detector.parameters():
+        parameter.requires_grad_(False)
     del checkpoint, cloned_frontend_state
     detector.conf = args.confidence_threshold
     detector.iou = args.nms_iou_threshold
@@ -343,6 +579,9 @@ def evaluate_codec(args: argparse.Namespace) -> None:
     points = []
     for base_qp in args.qps:
         evaluator = DetectionMAP()
+        temporal_evaluators = {
+            name: DetectionMAP() for name in TEMPORAL_BIN_ORDER
+        }
         sequence_records = []
         next_image_id = 0
         progress = tqdm(sequences, desc=f"{method_name}: base QP {base_qp}")
@@ -352,15 +591,18 @@ def evaluate_codec(args: argparse.Namespace) -> None:
                 / f"qp_{base_qp:02d}"
                 / f"{safe_name(sequence.name)}.bin"
             )
-            encode_sequence(
+            estimated_entropy_bits_by_frame = encode_sequence(
+                image_model,
                 model,
                 dataset,
                 sequence,
                 base_qp,
                 bitstream_path,
                 device,
+                args.reset_interval,
             )
             next_image_id = decode_and_evaluate_sequence(
+                image_model,
                 model,
                 detector,
                 evaluator,
@@ -375,31 +617,50 @@ def evaluate_codec(args: argparse.Namespace) -> None:
                     if reconstruction_root is not None
                     else None
                 ),
+                temporal_evaluators,
             )
             sequence_records.append(
-                sequence_rate_record(sequence, bitstream_path)
+                sequence_rate_record(
+                    sequence,
+                    bitstream_path,
+                    estimated_entropy_bits_by_frame,
+                )
             )
 
+        temporal_rates = aggregate_temporal_rate(sequence_records)
         point = {
             "base_qp": base_qp,
             **aggregate_rate(sequence_records),
             **evaluator.compute(),
             "sequences": sequence_records,
+            "temporal_diagnostics": temporal_diagnostics(
+                temporal_rates,
+                temporal_evaluators,
+            ),
         }
         points.append(point)
 
     output = {
-        "schema_version": 4,
+        "schema_version": 7,
         "method": args.method_name,
-        "codec": "DMC-only P-frame VCM",
+        "codec": "DCVC-RT DMCI + DMC all-frame VCM",
         "codec_config": {
+            "image_checkpoint": str(Path(args.image_ckpt).resolve()),
             "checkpoint": str(Path(args.video_ckpt).resolve()),
             "base_qps": list(args.qps),
             "qp_offsets": list(QP_OFFSETS),
-            "two_entropy_coders": False,
-            "external_seed": True,
+            "two_entropy_coders": (
+                "enabled when source width*height exceeds 1280*720"
+            ),
+            "reset_interval": args.reset_interval,
+            "codec_precision": args.codec_precision,
+            "external_seed": False,
+            "color_pipeline": "RGB -> full-range BT.709 YCbCr444 -> codec -> RGB",
+            "temporal_bins": list(TEMPORAL_BIN_ORDER),
+            "minimum_sequence_frames": args.minimum_sequence_frames,
         },
-        "protocol": EXTERNAL_SEED_PROTOCOL,
+        "protocol": ALL_FRAMES_PROTOCOL,
+        "comparison_scope": "end-to-end VCM system",
         "rate_source": "actual sequence-container bytes including headers",
         "rate_points": RATE_POINT_COUNT,
         "task": "object_detection",
@@ -407,14 +668,7 @@ def evaluate_codec(args: argparse.Namespace) -> None:
         "ground_truth": "normalized YOLO labels from evaluation manifest",
         "evaluation_id": evaluation_id(dataset, sequences),
         "dataset": dataset_summary(dataset, sequences),
-        "detector_config": detector_config(
-            args.task_model,
-            args.detector_size,
-            args.confidence_threshold,
-            args.nms_iou_threshold,
-            args.max_detections,
-            args.yolov5_weights,
-        ),
+        "detector_config": detector_metadata,
         "machine_frontend": machine_frontend,
         "points": points,
     }
@@ -426,8 +680,8 @@ def evaluate_codec(args: argparse.Namespace) -> None:
 
 def load_results(path: str | Path) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if data.get("schema_version") != 4:
-        raise ValueError(f"{path} does not use actual-bitstream evaluation schema v4")
+    if data.get("schema_version") not in (6, 7):
+        raise ValueError(f"{path} does not use all-frame evaluation schema v6/v7")
     if len(data.get("points", [])) != RATE_POINT_COUNT:
         raise ValueError(f"{path} must contain exactly four rate points")
     required_metadata = (
@@ -436,6 +690,8 @@ def load_results(path: str | Path) -> dict:
         "protocol",
         "ground_truth",
         "detector_config",
+        "machine_frontend",
+        "comparison_scope",
         "rate_source",
     )
     missing = [key for key in required_metadata if data.get(key) is None]
@@ -451,6 +707,7 @@ def validate_compatible_results(anchor: dict, candidate: dict) -> None:
         "protocol",
         "ground_truth",
         "detector_config",
+        "comparison_scope",
     ):
         anchor_value = json.dumps(
             anchor.get(key),
@@ -571,6 +828,9 @@ def compare_bd_rate(args: argparse.Namespace) -> None:
     result = {
         "anchor": anchor["method"],
         "candidate": candidate["method"],
+        "comparison_scope": anchor["comparison_scope"],
+        "anchor_machine_frontend": anchor["machine_frontend"],
+        "candidate_machine_frontend": candidate["machine_frontend"],
         "rate": args.rate,
         "metric": args.metric,
         "bd_rate_percent": compute_bd_rate(
@@ -630,7 +890,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", required=True, choices=("codec", "bdrate", "training"))
     parser.add_argument("--data-dir", help="Root containing evaluation frames and labels")
     parser.add_argument("--dataset-manifest", help="Full-resolution evaluation manifest JSON")
-    parser.add_argument("--video-ckpt", help="DMC-only checkpoint")
+    parser.add_argument("--image-ckpt", help="Frozen official DCVC-RT DMCI checkpoint")
+    parser.add_argument("--video-ckpt", help="Official DMC or trained VCM checkpoint")
     parser.add_argument("--method-name", default="dcvc_rt_vcm")
     parser.add_argument(
         "--qps",
@@ -642,7 +903,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cuda-index", type=int, default=0)
     parser.add_argument("--force-zero-thres", type=float)
+    parser.add_argument("--reset-interval", type=int, default=32)
+    parser.add_argument(
+        "--codec-precision",
+        choices=("fp16", "fp32"),
+        default="fp16",
+        help="FP16 matches the official DCVC-RT evaluation path",
+    )
     parser.add_argument("--max-sequences", type=int)
+    parser.add_argument(
+        "--minimum-sequence-frames",
+        type=int,
+        default=2,
+        help="Use 100 for the required long-sequence drift evaluation",
+    )
     parser.add_argument("--task-model", default="yolov5s")
     parser.add_argument("--yolov5-repo")
     parser.add_argument("--yolov5-weights")
@@ -665,9 +939,19 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     arguments = parse_args()
     if arguments.mode == "codec":
-        if not arguments.data_dir or not arguments.dataset_manifest or not arguments.video_ckpt:
+        if arguments.reset_interval < 0:
+            raise ValueError("--reset-interval must be non-negative")
+        if arguments.minimum_sequence_frames < 2:
+            raise ValueError("--minimum-sequence-frames must be at least 2")
+        if (
+            not arguments.data_dir
+            or not arguments.dataset_manifest
+            or not arguments.image_ckpt
+            or not arguments.video_ckpt
+        ):
             raise ValueError(
-                "codec mode requires --data-dir, --dataset-manifest and --video-ckpt"
+                "codec mode requires --data-dir, --dataset-manifest, "
+                "--image-ckpt and --video-ckpt"
             )
         evaluate_codec(arguments)
     elif arguments.mode == "bdrate":

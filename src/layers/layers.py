@@ -3,7 +3,7 @@
 
 import torch
 from torch import nn
-from .cuda_inference import CUSTOMIZED_CUDA_INFERENCE
+from .cuda_inference import CUSTOMIZED_CUDA_INFERENCE, should_use_custom_kernel
 if CUSTOMIZED_CUDA_INFERENCE:
     from .cuda_inference import DepthConvProxy, SubpelConv2xProxy
 
@@ -38,7 +38,7 @@ class SubpelConv2x(nn.Module):
         self.proxy = None
 
     def forward(self, x, to_cat=None, cat_at_front=True):
-        if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
+        if not should_use_custom_kernel(x):
             return self.forward_torch(x, to_cat, cat_at_front)
 
         return self.forward_cuda(x, to_cat, cat_at_front)
@@ -84,7 +84,7 @@ class DepthConvBlock(nn.Module):
         self.proxy = None
 
     def forward(self, x, quant_step=None, to_cat=None, cat_at_front=True):
-        if not CUSTOMIZED_CUDA_INFERENCE or not x.is_cuda:
+        if not should_use_custom_kernel(x):
             return self.forward_torch(x, quant_step, to_cat, cat_at_front)
 
         return self.forward_cuda(x, quant_step, to_cat, cat_at_front)

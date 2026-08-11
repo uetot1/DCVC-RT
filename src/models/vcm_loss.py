@@ -10,16 +10,55 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .yolov5_extractor import DEFAULT_FEATURE_LAYER_INDICES, YOLOv5FeatureExtractor
+from .yolov5_extractor import (
+    BACKBONE_ABLATION_FEATURE_LAYER_INDICES,
+    DEFAULT_CLONED_FRONTEND_LAST_LAYER,
+    DEFAULT_FEATURE_LAYER_INDICES,
+    YOLOv5FeatureExtractor,
+)
+
+
+def multi_level_feature_mse(
+    reconstructed_features: Sequence[torch.Tensor],
+    teacher_features: Sequence[torch.Tensor],
+    normalized_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return weighted multi-level MSE and the individual layer losses.
+
+    The main configuration matches YOLOv5's three PAN/FPN tensors supplied to
+    Detect (layers 17/20/23). It follows TransTIC's teacher/student multi-level
+    task-pyramid matching principle without claiming an exact P2--P6 replica.
+    """
+    if len(teacher_features) != len(reconstructed_features):
+        raise RuntimeError("teacher and reconstruction feature pyramids do not match")
+    if len(teacher_features) != normalized_weights.numel():
+        raise ValueError("one normalized weight is required per feature level")
+    layer_losses = torch.stack(
+        [
+            F.mse_loss(reconstructed_feature, teacher_feature)
+            for reconstructed_feature, teacher_feature in zip(
+                reconstructed_features,
+                teacher_features,
+                strict=True,
+            )
+        ]
+    )
+    feature_mse = torch.sum(
+        layer_losses * normalized_weights.to(
+            device=layer_losses.device,
+            dtype=layer_losses.dtype,
+        )
+    )
+    return feature_mse, layer_losses
 
 
 class VCMLoss(nn.Module):
     """Rate plus YOLO task-feature distortion.
 
     The teacher extracts targets from uncompressed frames under ``no_grad``.
-    The reconstruction extractor is a cloned YOLO front end and is jointly
-    optimized with DMC by default.  Its BatchNorm statistics remain frozen and
-    the original teacher remains completely frozen.
+    The reconstruction path jointly optimizes only cloned YOLO layers 0..4 with
+    DMC. Its layers 5..23 form a frozen pretrained task back end. BatchNorm
+    statistics remain fixed and the original teacher is frozen end to end.
     """
 
     def __init__(
@@ -30,6 +69,7 @@ class VCMLoss(nn.Module):
         yolov5_repository: str | Path | None = None,
         yolov5_weights: str | Path | None = None,
         train_cloned_frontend: bool = True,
+        cloned_frontend_last_layer: int = DEFAULT_CLONED_FRONTEND_LAST_LAYER,
     ):
         super().__init__()
         self.feature_layer_indices = tuple(int(index) for index in feature_layer_indices)
@@ -54,31 +94,37 @@ class VCMLoss(nn.Module):
             repository=yolov5_repository,
             weights=yolov5_weights,
             trainable=False,
+            cloned_frontend_last_layer=cloned_frontend_last_layer,
         )
         self.reconstruction_extractor = copy.deepcopy(self.teacher_extractor)
         self.train_cloned_frontend = bool(train_cloned_frontend)
         self.reconstruction_extractor.set_trainable(self.train_cloned_frontend)
 
     @property
-    def last_backbone_layer(self) -> int:
-        return self.reconstruction_extractor.last_backbone_layer
+    def cloned_frontend_last_layer(self) -> int:
+        return self.reconstruction_extractor.cloned_frontend_last_layer
+
+    @property
+    def feature_topology(self) -> str:
+        if self.feature_layer_indices == DEFAULT_FEATURE_LAYER_INDICES:
+            return "YOLOv5 PAN/FPN tensors supplied directly to Detect"
+        if self.feature_layer_indices == BACKBONE_ABLATION_FEATURE_LAYER_INDICES:
+            return "YOLOv5 backbone multi-scale ablation"
+        return "custom YOLOv5 graph feature layers"
 
     def cloned_frontend_state_dict(self) -> dict[str, torch.Tensor]:
-        return self.reconstruction_extractor.backbone_prefix.state_dict()
+        return self.reconstruction_extractor.cloned_frontend_state_dict()
 
     def load_cloned_frontend_state_dict(
         self,
         state_dict: dict[str, torch.Tensor],
     ) -> None:
-        self.reconstruction_extractor.backbone_prefix.load_state_dict(
-            state_dict,
-            strict=True,
-        )
+        self.reconstruction_extractor.load_cloned_frontend_state_dict(state_dict)
 
     def cloned_frontend_named_parameters(self):
         if not self.train_cloned_frontend:
             return iter(())
-        return self.reconstruction_extractor.backbone_prefix.named_parameters()
+        return self.reconstruction_extractor.cloned_frontend_named_parameters()
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -105,21 +151,10 @@ class VCMLoss(nn.Module):
         with torch.no_grad():
             teacher_features = self.teacher_extractor(original)
         reconstructed_features = self.reconstruction_extractor(reconstructed)
-        if len(teacher_features) != len(reconstructed_features):
-            raise RuntimeError("teacher and reconstruction feature pyramids do not match")
-
-        layer_losses = torch.stack(
-            [
-                F.mse_loss(reconstructed_feature, teacher_feature)
-                for reconstructed_feature, teacher_feature in zip(
-                    reconstructed_features,
-                    teacher_features,
-                    strict=True,
-                )
-            ]
-        )
-        feature_mse = torch.sum(
-            layer_losses * self.layer_weights.to(dtype=layer_losses.dtype)
+        feature_mse, layer_losses = multi_level_feature_mse(
+            reconstructed_features,
+            teacher_features,
+            self.layer_weights,
         )
         weighted_feature_mse = (
             float(lambda_rd) * float(distortion_weight) * feature_mse

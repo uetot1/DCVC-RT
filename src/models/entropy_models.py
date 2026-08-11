@@ -154,22 +154,17 @@ class BitEstimator(AEHelper, nn.Module):
         [TRAINING MODE] Tính Rate Loss (-log2(P)) của z_q trong lúc Train.
         Sử dụng phân phối CDF phi tham số được học từ các lớp f1, f2, f3, f4.
         """
-        B, C, H, W = z_q.size()
-        # Tạo index tương tự như hàm build_indexes, nhưng phù hợp cho forward
-        # QP map tới channel: index shape [C]
+        # Keep likelihood arithmetic FP32 when the evaluation codec is FP16.
+        z_q = z_q.float()
+        # One QP selects the per-channel CDF parameters and broadcasts over
+        # batch and spatial dimensions.
         device = z_q.device
-        index = torch.arange(C, dtype=torch.int32, device=device) + qp * self.channel
-        
-        # Để dùng với index_select trong f1, f2... x phải được biến đổi
-        # Tuy nhiên, f1 mong đợi index là 1D tensor cho dimension 0 của self.h [qp_num*channel, ...]
-        # Wait, self.h có shape [qp_num, channel, 1, 1]. Vậy index phải là qp.
-        # Check lại: `index = torch.arange(self.qp_num)` trong update. Vậy index chính là qp!
         index = torch.tensor([qp], dtype=torch.int32, device=device)
-        
+
         half = float(0.5)
         lower = self.get_cdf(z_q - half, index)
         upper = self.get_cdf(z_q + half, index)
-        
+
         pmf = upper - lower
         pmf = torch.clamp(pmf, min=1e-9) # Tránh log2(0)
         rate = -torch.log2(pmf)
@@ -309,19 +304,38 @@ class GaussianEncoder(AEHelper):
         self.cdf_group_index = self.entropy_coder.add_cdf(*self.get_cdf_info())
 
     def forward_rate(self, y_q, scales):
+        """Estimate Gaussian symbol rate in the entropy-coder scale domain.
+
+        The actual coder clamps scales to ``[0.11, 16]`` and selects one of
+        128 log-spaced CDF tables by truncating the table index. The forward
+        value below uses the same table scale. During training, a straight-
+        through identity gradient preserves optimization of the predicted
+        scale while keeping the rate value coder-aligned.
         """
-        [TRAINING MODE] Tính Rate Loss (-log2(P)) của y_q trong lúc Train.
-        Sử dụng phân phối chuẩn Gaussian với mean=0 và variance=scales^2.
-        """
-        scales = torch.clamp(scales, min=1e-9)
-        dist = torch.distributions.normal.Normal(0., scales)
-        
+        # Entropy likelihoods stay FP32 even when official evaluation runs the
+        # neural codec in FP16; this avoids half-precision CDF underflow.
+        y_q = y_q.float()
+        scales = torch.clamp(scales.float(), self.scale_min, self.scale_max)
+        continuous_index = (
+            (torch.log(scales) - self.log_scale_min) * self.log_step_recip
+        )
+        table_index = torch.floor(continuous_index).clamp_(0, self.scale_level - 1)
+        coder_scales = torch.exp(
+            table_index * self.log_scale_step + self.log_scale_min
+        )
+        if torch.is_grad_enabled() and scales.requires_grad:
+            coder_scales = scales + (coder_scales - scales).detach()
+
+        dist = torch.distributions.normal.Normal(0., coder_scales)
+
         lower = dist.cdf(y_q - 0.5)
         upper = dist.cdf(y_q + 0.5)
-        
+
         pmf = upper - lower
         pmf = torch.clamp(pmf, min=1e-9)
         rate = -torch.log2(pmf)
+        if self.force_zero_thres is not None:
+            rate = rate * (scales > self.force_zero_thres)
         return rate
 
     def process_with_mask(self, y, scales, means, mask):

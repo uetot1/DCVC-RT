@@ -3,14 +3,12 @@
 This script is evaluation-only. It does not import or modify the VCM training
 loop. For each of four QPs it performs:
 
-RGB frames -> FFmpeg YUV 4:2:0 -> HM encode/reconstruct -> FFmpeg RGB
+RGB frames -> FFmpeg BT.709 YUV 4:4:4 10-bit -> HM -> FFmpeg RGB
 -> frozen YOLOv5 -> mAP.
 
-The default conditional-P-frame protocol matches this project's DMC evaluator:
-frame 0 initializes prediction, its HM-reported picture bits and its mAP are
-excluded, while sequence-level HEVC headers remain counted. This is a
-conditional comparison, not a complete independently decodable HEVC rate.
-Use ``--protocol all-frames`` to count the complete HEVC bitstream instead.
+The default all-frame protocol counts the complete independently decodable HEVC
+bitstream and evaluates every frame, matching ``evaluate_vcm.py``. YUV 4:2:0 is
+still available for experiments whose original source domain is YUV420.
 """
 
 from __future__ import annotations
@@ -97,9 +95,15 @@ def write_concat_file(sequence: VideoSequence, output_path: Path) -> None:
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def raw_frame_bytes(width: int, height: int, bit_depth: int) -> int:
+def raw_frame_bytes(
+    width: int,
+    height: int,
+    bit_depth: int,
+    chroma_format: str,
+) -> int:
     bytes_per_sample = 1 if bit_depth == 8 else 2
-    return width * height * 3 // 2 * bytes_per_sample
+    samples_per_pixel = 3.0 if chroma_format == "444" else 1.5
+    return int(width * height * samples_per_pixel * bytes_per_sample)
 
 
 def rgb_to_yuv(
@@ -108,8 +112,16 @@ def rgb_to_yuv(
     concat_path: Path,
     yuv_path: Path,
     bit_depth: int,
+    chroma_format: str,
 ) -> None:
-    pixel_format = "yuv420p" if bit_depth == 8 else "yuv420p10le"
+    pixel_formats = {
+        ("420", 8): "yuv420p",
+        ("420", 10): "yuv420p10le",
+        ("444", 8): "yuv444p",
+        ("444", 10): "yuv444p10le",
+    }
+    pixel_format = pixel_formats[(chroma_format, bit_depth)]
+    output_range = "pc" if chroma_format == "444" else "tv"
     command = [
         ffmpeg,
         "-hide_banner",
@@ -126,7 +138,7 @@ def rgb_to_yuv(
         "-frames:v",
         str(sequence.frame_count),
         "-vf",
-        "scale=in_range=pc:out_range=tv:out_color_matrix=bt709",
+        f"scale=in_range=pc:out_range={output_range}:out_color_matrix=bt709",
         "-pix_fmt",
         pixel_format,
         "-f",
@@ -136,7 +148,7 @@ def rgb_to_yuv(
     ]
     run_command(command, f"FFmpeg RGB-to-YUV for {sequence.name}")
     expected_size = (
-        raw_frame_bytes(sequence.width, sequence.height, bit_depth)
+        raw_frame_bytes(sequence.width, sequence.height, bit_depth, chroma_format)
         * sequence.frame_count
     )
     actual_size = yuv_path.stat().st_size
@@ -156,6 +168,7 @@ def hm_encode(
     bitstream_path: Path,
     qp: int,
     bit_depth: int,
+    chroma_format: str,
     extra_arguments: list[str],
     progress: tqdm | None = None,
 ) -> str:
@@ -181,7 +194,8 @@ def hm_encode(
         f"--InputBitDepth={bit_depth}",
         f"--InternalBitDepth={bit_depth}",
         f"--OutputBitDepth={bit_depth}",
-        "--InputChromaFormat=420",
+        f"--InputChromaFormat={chroma_format}",
+        f"--ChromaFormatIDC={chroma_format}",
         *extra_arguments,
     ]
     # ``subprocess.run`` only returns after HM has encoded the *entire*
@@ -242,9 +256,17 @@ def yuv_to_rgb_frames(
     reconstructed_yuv: Path,
     output_dir: Path,
     bit_depth: int,
+    chroma_format: str,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    pixel_format = "yuv420p" if bit_depth == 8 else "yuv420p10le"
+    pixel_formats = {
+        ("420", 8): "yuv420p",
+        ("420", 10): "yuv420p10le",
+        ("444", 8): "yuv444p",
+        ("444", 10): "yuv444p10le",
+    }
+    pixel_format = pixel_formats[(chroma_format, bit_depth)]
+    input_range = "pc" if chroma_format == "444" else "tv"
     command = [
         ffmpeg,
         "-hide_banner",
@@ -263,7 +285,7 @@ def yuv_to_rgb_frames(
         "-frames:v",
         str(sequence.frame_count),
         "-vf",
-        "scale=in_range=tv:out_range=pc:in_color_matrix=bt709",
+        f"scale=in_range={input_range}:out_range=pc:in_color_matrix=bt709",
         "-pix_fmt",
         "rgb24",
         "-start_number",
@@ -429,6 +451,7 @@ def checkpoint_identity(
         "qps": list(args.qps),
         "protocol": args.protocol,
         "bit_depth": args.bit_depth,
+        "chroma_format": args.chroma_format,
         "hm_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "hm_extra_arg": list(args.hm_extra_arg),
         "task_model": args.task_model,
@@ -486,12 +509,10 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
         sequences = sequences[: args.max_sequences]
     if not sequences:
         raise RuntimeError("No evaluation sequences were selected")
-    for sequence in sequences:
-        if sequence.width % 2 or sequence.height % 2:
-            raise ValueError(
-                f"{sequence.name} is {sequence.width}x{sequence.height}; "
-                "YUV 4:2:0 requires even dimensions"
-            )
+    if args.chroma_format == "420" and any(
+        sequence.width % 2 or sequence.height % 2 for sequence in sequences
+    ):
+        raise ValueError("YUV420 evaluation requires even width and height")
 
     device = torch.device(f"cuda:{args.cuda_index}")
     detector = load_yolov5(
@@ -499,6 +520,8 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
         repository=args.yolov5_repo,
         weights=args.yolov5_weights,
     ).to(device).eval()
+    for parameter in detector.parameters():
+        parameter.requires_grad_(False)
     detector.conf = args.confidence_threshold
     detector.iou = args.nms_iou_threshold
     detector.max_det = args.max_detections
@@ -595,6 +618,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                     concat_path,
                     input_yuv,
                     args.bit_depth,
+                    args.chroma_format,
                 )
                 encoder_log = hm_encode(
                     encoder,
@@ -605,6 +629,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                     bitstream_path,
                     qp,
                     args.bit_depth,
+                    args.chroma_format,
                     args.hm_extra_arg,
                     progress,
                 )
@@ -624,6 +649,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                     reconstructed_yuv,
                     reconstructed_dir,
                     args.bit_depth,
+                    args.chroma_format,
                 )
                 next_image_id = evaluate_reconstructions(
                     detector,
@@ -712,8 +738,16 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
             "sequence headers retained"
         )
     )
+    detector_metadata = detector_config(
+        args.task_model,
+        args.detector_size,
+        args.confidence_threshold,
+        args.nms_iou_threshold,
+        args.max_detections,
+        args.yolov5_weights,
+    )
     output = {
-        "schema_version": 4,
+        "schema_version": 5,
         "method": args.method_name,
         "codec": "HEVC HM reference encoder",
         "codec_config": {
@@ -722,11 +756,16 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
             "configuration_name": args.configuration_name,
             "qps": list(args.qps),
             "bit_depth": args.bit_depth,
-            "chroma_format": "4:2:0",
-            "color_conversion": "BT.709 RGB full <-> YUV limited",
+            "chroma_format": "4:4:4" if args.chroma_format == "444" else "4:2:0",
+            "color_conversion": (
+                "BT.709 RGB full <-> YUV full"
+                if args.chroma_format == "444"
+                else "BT.709 RGB full <-> YUV420 limited"
+            ),
             "extra_arguments": list(args.hm_extra_arg),
         },
         "protocol": protocol,
+        "comparison_scope": "end-to-end VCM system",
         "rate_source": rate_source,
         "rate_points": RATE_POINT_COUNT,
         "task": "object_detection",
@@ -734,14 +773,13 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
         "ground_truth": "normalized YOLO labels from evaluation manifest",
         "evaluation_id": evaluation_id(dataset, sequences),
         "dataset": dataset_summary(dataset, sequences),
-        "detector_config": detector_config(
-            args.task_model,
-            args.detector_size,
-            args.confidence_threshold,
-            args.nms_iou_threshold,
-            args.max_detections,
-            args.yolov5_weights,
-        ),
+        "detector_config": detector_metadata,
+        "machine_frontend": {
+            "type": "pretrained_yolov5_frontend",
+            "weights_id": detector_metadata["weights_id"],
+            "trainable_during_codec_training": False,
+            "task_backend": "frozen_pretrained_yolov5",
+        },
         "points": points,
     }
     output_path = Path(args.output_dir) / f"{method_name}_results.json"
@@ -760,14 +798,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hm-config", required=True)
     parser.add_argument(
         "--configuration-name",
-        default="Low-Delay P",
+        default="HM Low-Delay RGB444 10-bit",
         help="Descriptive name recorded in the result JSON",
     )
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument(
         "--protocol",
         choices=tuple(PROTOCOLS),
-        default="conditional-pframes",
+        default="all-frames",
     )
     parser.add_argument(
         "--qps",
@@ -776,14 +814,20 @@ def parse_args() -> argparse.Namespace:
         default=(22, 27, 32, 37),
         metavar=("QP1", "QP2", "QP3", "QP4"),
     )
-    parser.add_argument("--bit-depth", type=int, choices=(8, 10), default=8)
+    parser.add_argument("--bit-depth", type=int, choices=(8, 10), default=10)
+    parser.add_argument(
+        "--chroma-format",
+        choices=("420", "444"),
+        default="444",
+        help="Use 444 for RGB/PNG sources; use 420 only for a YUV420-source protocol",
+    )
     parser.add_argument(
         "--hm-extra-arg",
         action="append",
         default=[],
         help="Repeat for each HM override, e.g. --hm-extra-arg=--IntraPeriod=-1",
     )
-    parser.add_argument("--method-name", default="HEVC HM Low-Delay P")
+    parser.add_argument("--method-name", default="HEVC HM RGB444 10-bit")
     parser.add_argument("--max-sequences", type=int)
     parser.add_argument(
         "--resume",

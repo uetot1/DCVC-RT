@@ -1,184 +1,220 @@
-"""Train the video-only DCVC-RT VCM codec with a hierarchical video protocol.
+"""Train the video component of the proposed DCVC-RT VCM system.
 
-Stage ``vimeo7`` trains on Vimeo-90K septuplets. Stage ``reds8`` fine-tunes
-that model on REDS sharp sequences using eight-picture clips.
-Frame 0 is an external reference seed and all later frames are coded by DMC.
-The only trainable parameters are DMC; distortion is machine Feature MSE.
+Protocol
+--------
+* RGB source frames are converted to full-range BT.709 YCbCr 4:4:4 for DMCI/DMC.
+* Frozen pretrained DMCI reconstructs frame 0; it is never optimized.
+* DMC codes frames 1..T and is optimized with ``R + lambda_feature * D_feature``.
+* ``D_feature`` matches YOLOv5 Detect-input task-pyramid layers 17/20/23,
+  inspired by TransTIC's multi-level FPN feature distortion.
+* Only cloned YOLOv5 layers 0..4 are trainable; layers 5..23 are the frozen
+  pretrained task back end.
+* Base QP is sampled uniformly from integers [0, 63]. Lambda is interpolated
+  log-linearly, and evaluation uses the fixed points 0, 21, 42, 63.
+* Launch with ``torchrun`` for DistributedDataParallel training.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
+import subprocess
+import time
+from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+# DCVC-RT's optional fused CUDA extension is inference-only and contains
+# parameter fusion that is not an autograd implementation. Force the pure
+# PyTorch path before importing any codec module.
+os.environ["DCVC_FORCE_TORCH"] = "1"
 
 import torch
-from torch import optim
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch import nn, optim
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
+from src.models.image_model import DMCI
 from src.models.vcm_loss import VCMLoss
+from src.models.vcm_system import QP_OFFSETS, VideoVCMSystem
 from src.models.video_model import DMC
-from src.models.yolov5_extractor import DEFAULT_FEATURE_LAYER_INDICES
+from src.models.yolov5_extractor import (
+    DEFAULT_CLONED_FRONTEND_LAST_LAYER,
+    DEFAULT_FEATURE_LAYER_INDICES,
+    ddp_find_unused_parameters,
+)
 from src.utils.dataset import VideoSequenceDataset
 
 
-QP_OFFSETS = (0, 8, 0, 4, 0, 4, 0, 4)
-HIERARCHICAL_DISTORTION_WEIGHTS = (0.5, 1.2, 0.5, 0.9, 0.5, 1.2, 0.5, 0.9)
-DEFAULT_VIMEO_CURRICULUM_FRAMES = (2, 3, 5, 7)
-DEFAULT_VIMEO_CURRICULUM_START_EPOCHS = (1, 6, 11, 21)
 DEFAULT_VALIDATION_QPS = (0, 21, 42, 63)
-METRICS = (
+DEFAULT_CURRICULUM_FRAMES = (3, 5, 7)
+DEFAULT_CURRICULUM_START_EPOCHS = (1, 3, 6)
+FIXED_METRICS = (
     "total_loss",
     "estimated_bpp",
     "feature_mse",
     "weighted_feature_mse",
     "lambda_rd",
+    "lambda_feature",
     "distortion_weight",
+    "rgb_mse",
+    "rgb_psnr",
+    "y_mse",
+    "chroma_mse",
     "base_qp",
     "coding_qp",
 )
-TRAINING_STAGE_ALIASES = {"long8": "reds8"}
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    rank: int
+    local_rank: int
+    world_size: int
+    device: torch.device
+    enabled: bool
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
 
 
 @dataclass(frozen=True)
 class TrainingSchedule:
     name: str
     num_frames: int
-    qp_offsets: tuple[int, ...]
-    distortion_weights: tuple[float, ...]
 
 
 @dataclass(frozen=True)
-class RestoredTrainingState:
+class RestoredState:
     start_epoch: int = 1
-    best_loss: float = float("inf")
-    stale_validations: int = 0
-    active_num_frames: int | None = None
+    best_proxy_score: float = float("inf")
+    optimizer_steps: int = 0
+    epoch_history: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
 class ValidationResult:
-    """Four-rate validation metrics used to select the best checkpoint."""
-
     mean: dict[str, float]
     by_qp: dict[int, dict[str, float]]
+    proxy_score: float
 
 
-def get_training_schedule(stage: str) -> TrainingSchedule:
-    """Return the published hierarchy truncated to the active clip length."""
-    stage = TRAINING_STAGE_ALIASES.get(stage, stage)
+def get_schedule(stage: str) -> TrainingSchedule:
     frame_counts = {"vimeo7": 7, "reds8": 8}
     if stage not in frame_counts:
         raise ValueError(f"Unknown training stage: {stage}")
-    num_frames = frame_counts[stage]
-    return TrainingSchedule(
-        name=stage,
-        num_frames=num_frames,
-        qp_offsets=QP_OFFSETS[:num_frames],
-        distortion_weights=HIERARCHICAL_DISTORTION_WEIGHTS[:num_frames],
-    )
+    return TrainingSchedule(stage, frame_counts[stage])
 
 
 def get_epoch_num_frames(args: argparse.Namespace, epoch: int) -> int:
-    """Select the Vimeo temporal crop length for the current epoch."""
-    schedule = get_training_schedule(args.training_stage)
-    if args.training_stage != "vimeo7":
+    schedule = get_schedule(args.training_stage)
+    if schedule.name != "vimeo7":
         return schedule.num_frames
-
-    frame_counts = tuple(args.vimeo_curriculum_frames)
-    start_epochs = tuple(args.vimeo_curriculum_start_epochs)
-    if len(frame_counts) != len(start_epochs):
-        raise ValueError(
-            "--vimeo-curriculum-frames and --vimeo-curriculum-start-epochs "
-            "must have the same length"
-        )
-    if not frame_counts or start_epochs[0] != 1:
-        raise ValueError("The Vimeo curriculum must start at epoch 1")
-    if any(
-        current >= following
-        for current, following in zip(start_epochs, start_epochs[1:])
-    ):
-        raise ValueError("Vimeo curriculum start epochs must be strictly increasing")
-    if any(
-        current >= following
-        for current, following in zip(frame_counts, frame_counts[1:])
-    ):
-        raise ValueError("Vimeo curriculum frame counts must be strictly increasing")
-    if frame_counts[0] < 2 or frame_counts[-1] != schedule.num_frames:
-        raise ValueError(
-            f"Vimeo curriculum must start at 2 or more frames and end at "
-            f"{schedule.num_frames} frames"
-        )
-
-    active_num_frames = frame_counts[0]
-    for start_epoch, num_frames in zip(start_epochs, frame_counts, strict=True):
-        if epoch < start_epoch:
+    counts = tuple(args.vimeo_curriculum_frames)
+    starts = tuple(args.vimeo_curriculum_start_epochs)
+    if len(counts) != len(starts) or not counts:
+        raise ValueError("Vimeo curriculum frame/start lists must be non-empty and equal length")
+    if starts[0] != 1 or any(a >= b for a, b in zip(starts, starts[1:])):
+        raise ValueError("Vimeo curriculum starts must begin at 1 and strictly increase")
+    if any(a >= b for a, b in zip(counts, counts[1:])):
+        raise ValueError("Vimeo curriculum frame counts must strictly increase")
+    if counts[0] < 2 or counts[-1] != schedule.num_frames:
+        raise ValueError(f"Vimeo curriculum must end at {schedule.num_frames} frames")
+    active = counts[0]
+    for start, count in zip(starts, counts, strict=True):
+        if epoch < start:
             break
-        active_num_frames = num_frames
-    return active_num_frames
+        active = count
+    return active
 
 
-def interpolate_lambda(base_qp: int, lambda_min: float, lambda_max: float) -> float:
-    """Log-linearly interpolate lambda exactly as DCVC-FM."""
-    if not 0 <= base_qp <= 63:
+def interpolate_lambda(
+    base_qp: int,
+    lambda_min: float,
+    lambda_max: float,
+    lambda_scale: float = 1.0,
+) -> float:
+    """Log-linearly interpolate a feature-distortion multiplier."""
+    if not 0 <= int(base_qp) <= 63:
         raise ValueError("base_qp must be in [0, 63]")
-    if not 0 < lambda_min <= lambda_max:
-        raise ValueError("lambda range must satisfy 0 < lambda_min <= lambda_max")
-    position = base_qp / 63.0
-    return math.exp(
+    if not 0 < lambda_min <= lambda_max or lambda_scale <= 0:
+        raise ValueError("lambda range and lambda_scale must be positive")
+    position = int(base_qp) / 63.0
+    base = math.exp(
         math.log(lambda_min)
         + position * (math.log(lambda_max) - math.log(lambda_min))
     )
+    return float(lambda_scale * base)
 
 
-def resolve_validation_qps(args: argparse.Namespace) -> tuple[int, ...]:
-    """Normalize the four-rate validation protocol and support the old flag."""
-    configured_qps = getattr(args, "validation_qps", None)
-    legacy_qp = getattr(args, "validation_qp", None)
-    if configured_qps is not None and legacy_qp is not None:
-        raise ValueError(
-            "Use --validation-qps or the deprecated --validation-qp, not both"
-        )
-    if legacy_qp is not None:
-        validation_qps = (int(legacy_qp),)
-        print(
-            "warning: --validation-qp is deprecated; use "
-            f"--validation-qps {' '.join(map(str, validation_qps))}"
-        )
+def init_distributed() -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    enabled = world_size > 1
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        backend = "nccl"
     else:
-        validation_qps = tuple(
-            int(qp)
-            for qp in (
-                configured_qps
-                if configured_qps is not None
-                else DEFAULT_VALIDATION_QPS
-            )
-        )
-    if not validation_qps:
-        raise ValueError("validation_qps must contain at least one QP")
-    if len(set(validation_qps)) != len(validation_qps):
-        raise ValueError("validation_qps must not contain duplicate values")
-    if any(not 0 <= qp <= 63 for qp in validation_qps):
-        raise ValueError("every validation QP must be in [0, 63]")
-    return validation_qps
+        device = torch.device("cpu")
+        backend = "gloo"
+    if enabled:
+        dist.init_process_group(backend=backend, init_method="env://")
+    return DistributedContext(rank, local_rank, world_size, device, enabled)
 
 
-def load_initial_weights(
-    model: DMC,
-    criterion: VCMLoss,
-    path: str | Path,
-    device: torch.device,
-) -> None:
-    """Load DMC and, when present, the jointly trained cloned front end."""
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+def cleanup_distributed(context: DistributedContext) -> None:
+    if context.enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def seed_everything(seed: int, rank: int, deterministic: bool) -> None:
+    process_seed = int(seed) + int(rank)
+    random.seed(process_seed)
+    torch.manual_seed(process_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(process_seed)
+        torch.backends.cudnn.benchmark = not deterministic
+        torch.backends.cudnn.deterministic = deterministic
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def git_revision() -> str | None:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return completed.stdout.strip() or None
+
+
+def checkpoint_state(path: str | Path) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    metadata = checkpoint if isinstance(checkpoint, dict) else {}
     if isinstance(checkpoint, dict):
         state = checkpoint.get(
             "dmc_state_dict",
@@ -186,438 +222,679 @@ def load_initial_weights(
         )
     else:
         state = checkpoint
-    model.load_state_dict({key.removeprefix("module."): value for key, value in state.items()})
-    cloned_state = (
-        checkpoint.get("cloned_frontend_state_dict")
-        if isinstance(checkpoint, dict)
-        else None
-    )
+    if not isinstance(state, dict):
+        raise ValueError(f"Could not find a model state dictionary in {path}")
+    normalized = {key.removeprefix("module."): value for key, value in state.items()}
+    return normalized, metadata
+
+
+def load_image_weights(model: DMCI, path: str | Path) -> None:
+    state, _ = checkpoint_state(path)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+
+def load_video_initialization(system: VideoVCMSystem, path: str | Path) -> None:
+    state, metadata = checkpoint_state(path)
+    system.dmc.load_state_dict(state, strict=True)
+    cloned_state = metadata.get("cloned_frontend_state_dict")
     if cloned_state is not None:
-        criterion.load_cloned_frontend_state_dict(cloned_state)
-        print(f"Loaded DMC and cloned YOLO front end from {path}")
-    else:
-        print(
-            f"Loaded DMC from {path}; cloned YOLO front end starts from the "
-            "pretrained teacher weights"
-        )
+        expected_state = system.objective.cloned_frontend_state_dict()
+        compatible_state = {
+            key: value
+            for key, value in cloned_state.items()
+            if key in expected_state and value.shape == expected_state[key].shape
+        }
+        missing = sorted(set(expected_state) - set(compatible_state))
+        if missing:
+            print(
+                "Video initialization contains an incompatible cloned front end; "
+                "DMC weights were loaded and clone layers 0..4 remain initialized "
+                "from the frozen YOLO teacher."
+            )
+        else:
+            system.objective.load_cloned_frontend_state_dict(compatible_state)
+            ignored = len(cloned_state) - len(compatible_state)
+            if ignored:
+                print(
+                    "Migrated cloned YOLO layers 0..4 from a legacy checkpoint; "
+                    f"ignored {ignored} state entries from obsolete deeper layers."
+                )
 
 
 def make_loader(
     args: argparse.Namespace,
+    context: DistributedContext,
     root_dir: str,
     list_file: str | Path | None,
-    shuffle: bool,
-) -> DataLoader:
+    training: bool,
+) -> tuple[DataLoader, DistributedSampler | None]:
     dataset = VideoSequenceDataset(
         root_dir,
         list_file=list_file,
         crop_size=args.crop_size,
-        num_frames=get_training_schedule(args.training_stage).num_frames,
-        training=shuffle,
-        samples_per_sequence=args.samples_per_sequence if shuffle else 1,
+        num_frames=get_schedule(args.training_stage).num_frames,
+        training=training,
+        samples_per_sequence=args.samples_per_sequence if training else 1,
     )
-    return DataLoader(
+    sampler = (
+        DistributedSampler(
+            dataset,
+            num_replicas=context.world_size,
+            rank=context.rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        )
+        if training and context.enabled
+        else None
+    )
+    loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        shuffle=shuffle,
+        batch_size=args.batch_size_per_gpu,
+        shuffle=training and sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=shuffle,
+        drop_last=training,
+        # Curriculum changes dataset.num_frames between epochs. Fresh workers
+        # are required so worker-side dataset copies observe that value.
+        persistent_workers=False,
     )
+    return loader, sampler
 
 
-def run_gop(
-    dmc: DMC,
-    criterion: VCMLoss,
+def make_optimizer(system: VideoVCMSystem, args: argparse.Namespace) -> optim.AdamW:
+    groups: list[dict[str, Any]] = []
+    sources = (
+        ("dmc", system.dmc.named_parameters(), args.learning_rate),
+        (
+            "cloned_frontend",
+            system.objective.cloned_frontend_named_parameters(),
+            args.frontend_learning_rate,
+        ),
+    )
+    for source, named_parameters, learning_rate in sources:
+        decay: list[nn.Parameter] = []
+        no_decay: list[nn.Parameter] = []
+        for name, parameter in named_parameters:
+            if not parameter.requires_grad:
+                continue
+            leaf = name.rsplit(".", 1)[-1]
+            target = (
+                no_decay
+                if parameter.ndim <= 1 or leaf == "bias" or leaf.startswith("q_")
+                else decay
+            )
+            target.append(parameter)
+        if decay:
+            groups.append(
+                {
+                    "params": decay,
+                    "lr": learning_rate,
+                    "weight_decay": args.weight_decay,
+                    "source": source,
+                }
+            )
+        if no_decay:
+            groups.append(
+                {
+                    "params": no_decay,
+                    "lr": learning_rate,
+                    "weight_decay": 0.0,
+                    "source": source,
+                }
+            )
+    if not groups:
+        raise RuntimeError("No trainable DMC or cloned-front-end parameters")
+    return optim.AdamW(groups)
+
+
+def unwrap(model: VideoVCMSystem | DDP) -> VideoVCMSystem:
+    return model.module if isinstance(model, DDP) else model
+
+
+def global_boolean(value: bool, context: DistributedContext) -> bool:
+    flag = torch.tensor(int(value), device=context.device, dtype=torch.int32)
+    if context.enabled:
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def parameter_grad_norm(parameters) -> float:
+    squared = 0.0
+    for parameter in parameters:
+        if parameter.grad is not None:
+            squared += float(parameter.grad.detach().float().pow(2).sum())
+    return math.sqrt(squared)
+
+
+def combine_chunk_metrics(
+    chunks: list[tuple[int, dict[str, torch.Tensor]]],
+    seed_metrics: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    frame_count = sum(length for length, _ in chunks)
+    combined = {
+        key: sum(length * metrics[key] for length, metrics in chunks) / frame_count
+        for key in chunks[0][1]
+    }
+    combined.update(seed_metrics)
+    return combined
+
+
+def train_gop(
+    model: VideoVCMSystem | DDP,
     frames: torch.Tensor,
     base_qp: int,
+    lambda_feature: float,
     args: argparse.Namespace,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Code P-frames in one GOP and return their mean VCM loss.
+    context: DistributedContext,
+    synchronize_last_chunk: bool,
+) -> tuple[bool, dict[str, torch.Tensor] | None]:
+    module = unwrap(model)
+    seed_metrics = module.prepare_gop(frames[:, 0], base_qp)
+    p_frame_count = frames.shape[1] - 1
+    chunk_size = p_frame_count if args.tbptt_steps <= 0 else args.tbptt_steps
+    chunks: list[tuple[int, dict[str, torch.Tensor]]] = []
+    for first in range(1, frames.shape[1], chunk_size):
+        last = min(first + chunk_size, frames.shape[1])
+        is_last_chunk = last == frames.shape[1]
+        should_sync = synchronize_last_chunk and is_last_chunk
+        sync_context = nullcontext() if should_sync or not isinstance(model, DDP) else model.no_sync()
+        with sync_context:
+            chunk_loss, chunk_metrics = model(
+                frames[:, first:last],
+                int(base_qp),
+                first,
+                float(lambda_feature),
+            )
+            finite_loss = global_boolean(bool(torch.isfinite(chunk_loss)), context)
+            if not finite_loss:
+                return False, None
+            weight = (last - first) / p_frame_count / args.accumulation_steps
+            (chunk_loss * weight).backward()
+        chunks.append((last - first, chunk_metrics))
+        if args.tbptt_steps > 0 and not is_last_chunk:
+            module.detach_dpb()
+    return True, combine_chunk_metrics(chunks, seed_metrics)
 
-    ``frames[:, 0]`` is deliberately not sent through an image codec. It is an
-    externally supplied decoded reference, which is the required starting
-    condition for a P-frame-only DMC codec.
-    """
-    schedule = get_training_schedule(args.training_stage)
-    if frames.shape[1] < 2:
-        raise ValueError("A clip needs one seed frame and at least one coded P-frame")
-    if schedule.name == "reds8" and frames.shape[1] != schedule.num_frames:
-        raise ValueError(
-            f"Stage {schedule.name} requires {schedule.num_frames} pictures, "
-            f"but received {frames.shape[1]}"
-        )
-    if args.training_stage == "vimeo7" and frames.shape[1] > schedule.num_frames:
-        raise ValueError(
-            f"Stage {schedule.name} accepts at most {schedule.num_frames} pictures, "
-            f"but received {frames.shape[1]}"
-        )
 
-    dmc.clear_dpb()
-    dmc.set_curr_poc(0)
-    dmc.add_ref_frame(feature=None, frame=frames[:, 0])
-    lambda_rd = interpolate_lambda(base_qp, args.lambda_min, args.lambda_max)
-    per_frame = []
-    for frame_index in range(1, frames.shape[1]):
-        coding_qp = base_qp + schedule.qp_offsets[frame_index]
-        distortion_weight = schedule.distortion_weights[frame_index]
-        original = frames[:, frame_index]
-        reconstructed, estimated_bpp = dmc.forward_train(original, coding_qp)
-        details = criterion(
-            original,
-            reconstructed,
-            estimated_bpp,
-            lambda_rd,
-            distortion_weight=distortion_weight,
-            return_details=True,
-        )
-        details["base_qp"] = details["total_loss"].new_tensor(float(base_qp))
-        details["coding_qp"] = details["total_loss"].new_tensor(float(coding_qp))
-        per_frame.append(details)
-
-    return (
-        torch.stack([entry["total_loss"] for entry in per_frame]).mean(),
-        {
-            key: torch.stack([entry[key] for entry in per_frame]).mean()
-            for key in (*METRICS, *criterion.layer_metric_names)
-        },
+def reduce_metrics(
+    metric_sums: dict[str, float],
+    count: int,
+    context: DistributedContext,
+) -> dict[str, float]:
+    if count <= 0:
+        raise RuntimeError("No valid batches were processed")
+    keys = tuple(sorted(metric_sums))
+    values = torch.tensor(
+        [metric_sums[key] for key in keys] + [float(count)],
+        device=context.device,
+        dtype=torch.float64,
     )
+    if context.enabled:
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    total_count = float(values[-1].item())
+    return {key: float(values[index].item() / total_count) for index, key in enumerate(keys)}
 
 
-def aggregate(entries: list[dict[str, torch.Tensor]]) -> dict[str, float]:
+def aggregate_entries(entries: list[dict[str, torch.Tensor]]) -> dict[str, float]:
     if not entries:
-        raise RuntimeError("No batches were processed")
+        raise RuntimeError("No validation batches were processed")
     return {
-        key: sum(float(entry[key].detach()) for entry in entries) / len(entries)
+        key: sum(float(entry[key]) for entry in entries) / len(entries)
         for key in entries[0]
     }
 
 
-def make_optimizer(
-    dmc: DMC,
-    criterion: VCMLoss,
-    learning_rate: float,
-    frontend_learning_rate: float,
-    weight_decay: float,
-) -> optim.AdamW:
-    """Build AdamW without decaying quantization controls, biases or 1-D scales."""
-    parameter_groups = []
-    sources = (
-        ("dmc", dmc.named_parameters(), learning_rate),
-        (
-            "cloned_frontend",
-            criterion.cloned_frontend_named_parameters(),
-            frontend_learning_rate,
-        ),
-    )
-    for source, named_parameters, source_learning_rate in sources:
-        decay_parameters = []
-        no_decay_parameters = []
-        for name, parameter in named_parameters:
-            if not parameter.requires_grad:
-                continue
-            leaf_name = name.rsplit(".", 1)[-1]
-            no_decay = (
-                parameter.ndim <= 1
-                or leaf_name == "bias"
-                or leaf_name.startswith("q_")
-            )
-            target = no_decay_parameters if no_decay else decay_parameters
-            target.append(parameter)
-        if decay_parameters:
-            parameter_groups.append(
-                {
-                    "params": decay_parameters,
-                    "weight_decay": weight_decay,
-                    "lr": source_learning_rate,
-                    "source": source,
-                }
-            )
-        if no_decay_parameters:
-            parameter_groups.append(
-                {
-                    "params": no_decay_parameters,
-                    "weight_decay": 0.0,
-                    "lr": source_learning_rate,
-                    "source": source,
-                }
-            )
-    if not parameter_groups:
-        raise RuntimeError("No trainable DMC or cloned-front-end parameters")
-    return optim.AdamW(parameter_groups, lr=learning_rate)
-
-
 @torch.no_grad()
 def validate(
-    dmc: DMC,
-    criterion: VCMLoss,
+    system: VideoVCMSystem,
     loader: DataLoader,
     args: argparse.Namespace,
     device: torch.device,
 ) -> ValidationResult:
-    """Validate every deterministic clip at all configured rate points."""
-    dmc.eval()
-    criterion.eval()
-    entries_by_qp = {qp: [] for qp in args.validation_qps}
+    system.eval()
+    full_frames = get_schedule(args.training_stage).num_frames
+    loader.dataset.set_num_frames(full_frames)
+    entries_by_qp: dict[int, list[dict[str, torch.Tensor]]] = {
+        qp: [] for qp in args.validation_qps
+    }
     for batch_index, frames in enumerate(loader):
         if args.max_validation_batches is not None and batch_index >= args.max_validation_batches:
             break
-        frames = frames.to(device)
+        frames = frames.to(device, non_blocking=True)
         for base_qp in args.validation_qps:
-            _, details = run_gop(dmc, criterion, frames, base_qp, args)
-            entries_by_qp[base_qp].append(
-                {key: value.detach() for key, value in details.items()}
+            lambda_feature = interpolate_lambda(
+                base_qp,
+                args.lambda_min,
+                args.lambda_max,
+                args.lambda_scale,
             )
-
-    by_qp = {
-        base_qp: aggregate(entries)
-        for base_qp, entries in entries_by_qp.items()
-    }
+            seed_metrics = system.prepare_gop(frames[:, 0], base_qp)
+            _, metrics = system(
+                frames[:, 1:],
+                base_qp,
+                1,
+                lambda_feature,
+            )
+            metrics.update(seed_metrics)
+            entries_by_qp[base_qp].append(
+                {key: value.detach().cpu() for key, value in metrics.items()}
+            )
+    by_qp = {qp: aggregate_entries(entries) for qp, entries in entries_by_qp.items()}
     mean = {
         key: sum(metrics[key] for metrics in by_qp.values()) / len(by_qp)
         for key in next(iter(by_qp.values()))
     }
-    return ValidationResult(mean=mean, by_qp=by_qp)
+    mean_log_objective = sum(
+        VideoVCMSystem.selection_score(metrics) for metrics in by_qp.values()
+    ) / len(by_qp)
+    proxy_score = math.exp(mean_log_objective)
+    return ValidationResult(mean, by_qp, proxy_score)
 
 
 class TrainingLogger:
+    """Durable epoch logs and a run-specific plot generated during cleanup.
+
+    Every checkpoint embeds ``history``. A resumed Kaggle run can therefore
+    rebuild a cumulative CSV and plot even when only the checkpoint survived.
+    """
+
+    PLOT_METRICS = (
+        ("total_loss", "Total loss"),
+        ("estimated_bpp", "Estimated BPP"),
+        ("feature_mse", "Feature MSE"),
+    )
+
     def __init__(
         self,
         directory: Path,
         args: argparse.Namespace,
         metric_names: tuple[str, ...],
+        previous_history: tuple[dict[str, Any], ...] = (),
     ):
         directory.mkdir(parents=True, exist_ok=True)
-        run_name = f"video_vcm_{datetime.now():%Y%m%d_%H%M%S}"
+        run_name = f"video_vcm_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}Z"
         self.metric_names = metric_names
         self.validation_qps = tuple(args.validation_qps)
-        self.path = directory / f"{run_name}.csv"
-        self.file = self.path.open("w", newline="", encoding="utf-8")
-        self.writer = csv.DictWriter(
-            self.file,
-            fieldnames=[
-                "epoch",
-                "learning_rate",
-                *[f"train_{key}" for key in self.metric_names],
-                *[f"val_{key}" for key in self.metric_names],
-                *[
-                    f"val_qp{qp}_{key}"
-                    for qp in self.validation_qps
-                    for key in self.metric_names
-                ],
+        self.csv_path = directory / f"{run_name}.csv"
+        self.batch_path = directory / f"{run_name}_batches.jsonl"
+        self.plot_path = directory / f"{run_name}_training_curves.png"
+        self.latest_csv_path = directory / "latest_training_history.csv"
+        self.latest_plot_path = directory / "latest_training_curves.png"
+        self.csv_file = self.csv_path.open("w", newline="", encoding="utf-8")
+        self.batch_file = self.batch_path.open("w", encoding="utf-8")
+        self.fieldnames = [
+            "epoch",
+            "active_num_frames",
+            "optimizer_steps",
+            "dmc_learning_rate",
+            "frontend_learning_rate",
+            "proxy_score",
+            "grad_norm",
+            "dmc_grad_norm",
+            "frontend_grad_norm",
+            "skipped_batches",
+            "epoch_seconds",
+            "gpu_peak_memory_mib",
+            *[f"train_{key}" for key in metric_names],
+            *[f"val_{key}" for key in metric_names],
+            *[
+                f"val_qp{qp}_{key}"
+                for qp in self.validation_qps
+                for key in metric_names
             ],
-        )
+        ]
+        self.writer = csv.DictWriter(self.csv_file, fieldnames=self.fieldnames)
         self.writer.writeheader()
-        (directory / f"{run_name}.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+        self.history: list[dict[str, Any]] = []
+        self._plot_warning_reported = False
+        for previous_row in previous_history:
+            row = {key: previous_row.get(key) for key in self.fieldnames}
+            self.writer.writerow(row)
+            self.history.append(row)
+        self._flush_epoch_log()
 
-    def log(
-        self,
-        epoch: int,
-        learning_rate: float,
-        train_metrics: dict[str, float],
-        val_metrics: dict[str, float] | None,
-        val_metrics_by_qp: dict[int, dict[str, float]] | None,
-    ):
-        row = {"epoch": epoch, "learning_rate": learning_rate}
-        row.update(
-            {f"train_{key}": train_metrics[key] for key in self.metric_names}
-        )
-        if val_metrics is not None:
-            row.update(
-                {f"val_{key}": val_metrics[key] for key in self.metric_names}
+    def _flush_epoch_log(self) -> None:
+        self.csv_file.flush()
+        os.fsync(self.csv_file.fileno())
+        shutil.copy2(self.csv_path, self.latest_csv_path)
+
+    @staticmethod
+    def _numeric_series(
+        history: list[dict[str, Any]],
+        key: str,
+    ) -> tuple[list[int], list[float]]:
+        epochs: list[int] = []
+        values: list[float] = []
+        for row in history:
+            value = row.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric):
+                continue
+            epochs.append(int(row["epoch"]))
+            values.append(numeric)
+        return epochs, values
+
+    def update_plot(self) -> None:
+        """Atomically render loss, rate and feature curves for the whole run."""
+        if not self.history:
+            return
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            from matplotlib import pyplot as plt
+
+            figure, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+            for axis, (metric, title) in zip(axes, self.PLOT_METRICS, strict=True):
+                train_epochs, train_values = self._numeric_series(
+                    self.history,
+                    f"train_{metric}",
+                )
+                validation_epochs, validation_values = self._numeric_series(
+                    self.history,
+                    f"val_{metric}",
+                )
+                if train_values:
+                    axis.plot(
+                        train_epochs,
+                        train_values,
+                        marker="o",
+                        linewidth=2,
+                        label="train",
+                    )
+                if validation_values:
+                    axis.plot(
+                        validation_epochs,
+                        validation_values,
+                        marker="s",
+                        linewidth=2,
+                        label="validation (4-QP mean)",
+                    )
+                axis.set_title(title)
+                axis.set_xlabel("Epoch")
+                axis.grid(True, alpha=0.3)
+                axis.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4))
+                if train_values or validation_values:
+                    axis.legend()
+
+            last_epoch = int(self.history[-1]["epoch"])
+            figure.suptitle(
+                f"DCVC-RT VCM training curves - through epoch {last_epoch}"
             )
-        if val_metrics_by_qp is not None:
-            for qp, metrics in val_metrics_by_qp.items():
+            figure.tight_layout()
+            temporary = self.plot_path.with_suffix(".png.tmp")
+            figure.savefig(temporary, format="png", dpi=160, bbox_inches="tight")
+            plt.close(figure)
+            temporary.replace(self.plot_path)
+            shutil.copy2(self.plot_path, self.latest_plot_path)
+        except Exception as error:  # a plot failure must not kill a long run
+            if not self._plot_warning_reported:
+                print(f"warning: could not update training plot: {error}")
+                self._plot_warning_reported = True
+
+    def log_batch(self, record: dict[str, Any]) -> None:
+        self.batch_file.write(json.dumps(record, sort_keys=True) + "\n")
+        self.batch_file.flush()
+
+    def log_epoch(
+        self,
+        metadata: dict[str, Any],
+        train_metrics: dict[str, float],
+        validation: ValidationResult | None,
+    ) -> None:
+        row = dict(metadata)
+        row.update({f"train_{key}": train_metrics.get(key) for key in self.metric_names})
+        if validation is not None:
+            row.update({f"val_{key}": validation.mean.get(key) for key in self.metric_names})
+            for qp, metrics in validation.by_qp.items():
                 row.update(
                     {
-                        f"val_qp{qp}_{key}": metrics[key]
+                        f"val_qp{qp}_{key}": metrics.get(key)
                         for key in self.metric_names
                     }
                 )
+        row = {key: row.get(key) for key in self.fieldnames}
         self.writer.writerow(row)
-        self.file.flush()
+        self.history.append(row)
+        self._flush_epoch_log()
 
-    def close(self):
-        self.file.close()
+    def close(self) -> None:
+        if self.history:
+            self.update_plot()
+        self.csv_file.close()
+        self.batch_file.close()
 
 
-def restore(
-    path: str | None,
-    dmc: DMC,
-    criterion: VCMLoss,
-    optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.LRScheduler,
-    device: torch.device,
-    training_stage: str,
-    checkpoint_selection: dict[str, object],
-) -> RestoredTrainingState:
-    if path is None:
-        return RestoredTrainingState()
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
-    optimizer_config = checkpoint.get("optimizer_config")
-    if optimizer_config is None or optimizer_config.get("name") != "AdamW":
-        raise ValueError(
-            "This resume checkpoint does not contain a compatible AdamW state. "
-            "Load its DMC weights with --video-init instead."
-        )
-    saved_train_clone = bool(
-        optimizer_config.get("train_cloned_frontend", False)
-    )
-    if saved_train_clone != criterion.train_cloned_frontend:
-        raise ValueError(
-            "Resume checkpoint and current --train-cloned-frontend setting "
-            "do not match. Use --video-init for a new training run instead."
-        )
-    saved_stage = checkpoint.get("training_stage")
-    normalized_saved_stage = TRAINING_STAGE_ALIASES.get(saved_stage, saved_stage)
-    if normalized_saved_stage is not None and normalized_saved_stage != training_stage:
-        raise ValueError(
-            f"Checkpoint stage is {saved_stage}, but --training-stage is "
-            f"{training_stage}. Use --video-init for a stage transition."
-        )
-    saved_objective = checkpoint.get("feature_objective", {})
-    saved_layers = tuple(saved_objective.get("layer_indices", ()))
-    if saved_layers and saved_layers != criterion.feature_layer_indices:
-        raise ValueError(
-            "Resume checkpoint feature layers do not match the current "
-            "--feature-layer-indices. Use --video-init for a new run."
-        )
-    saved_weights = saved_objective.get("normalized_layer_weights")
-    current_weights = criterion.layer_weights.detach().cpu().tolist()
-    if saved_weights is not None and (
-        len(saved_weights) != len(current_weights)
-        or any(
-            abs(float(saved) - float(current)) > 1e-7
-            for saved, current in zip(
-                saved_weights,
-                current_weights,
-                strict=True,
-            )
-        )
-    ):
-        raise ValueError(
-            "Resume checkpoint feature weights do not match the current "
-            "--feature-layer-weights. Use --video-init for a new run."
-        )
-    dmc.load_state_dict(checkpoint["dmc_state_dict"])
-    cloned_state = checkpoint.get("cloned_frontend_state_dict")
-    if criterion.train_cloned_frontend and cloned_state is None:
-        raise ValueError(
-            "This legacy checkpoint has no trainable cloned YOLO front end. "
-            "Start the new joint-training protocol with --video-init instead "
-            "of --resume."
-        )
-    if cloned_state is not None:
-        criterion.load_cloned_frontend_state_dict(cloned_state)
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    training_state = checkpoint.get("training_state", {})
-    saved_selection = checkpoint.get("checkpoint_selection")
-    selection_matches = saved_selection == checkpoint_selection
-    if not selection_matches:
-        print(
-            "Checkpoint-selection protocol changed; retaining model/optimizer "
-            "state but resetting best loss and early-stopping counter."
-        )
-    return RestoredTrainingState(
-        start_epoch=int(checkpoint["epoch"]) + 1,
-        best_loss=(
-            float(training_state.get("best_loss", float("inf")))
-            if selection_matches
-            else float("inf")
-        ),
-        stale_validations=(
-            int(training_state.get("stale_validations", 0))
-            if selection_matches
-            else 0
-        ),
-        active_num_frames=training_state.get("active_num_frames"),
-    )
+def rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state()
+    return state
+
+
+def gather_rng_states(context: DistributedContext) -> list[dict[str, Any]]:
+    local = rng_state()
+    if not context.enabled:
+        return [local]
+    gathered: list[dict[str, Any] | None] = [None] * context.world_size
+    dist.all_gather_object(gathered, local)
+    return [state for state in gathered if state is not None]
+
+
+def restore_rng_state(states: list[dict[str, Any]] | None, context: DistributedContext) -> None:
+    if not states or context.rank >= len(states):
+        return
+    state = states[context.rank]
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.set_rng_state(state["torch_cuda"])
 
 
 def save_checkpoint(
     path: Path,
     epoch: int,
-    dmc: DMC,
-    criterion: VCMLoss,
+    system: VideoVCMSystem,
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.LRScheduler,
-    metrics: dict[str, float],
-    validation_metrics_by_qp: dict[int, dict[str, float]] | None,
-    schedule: TrainingSchedule,
-    active_num_frames: int,
-    best_loss: float,
-    stale_validations: int,
     args: argparse.Namespace,
-    checkpoint_selection: dict[str, object],
-):
+    train_metrics: dict[str, float],
+    validation: ValidationResult | None,
+    best_proxy_score: float,
+    optimizer_steps: int,
+    rng_states: list[dict[str, Any]],
+    epoch_history: list[dict[str, Any]],
+) -> None:
     payload = {
-        "schema_version": 8,
+        "schema_version": 12,
         "epoch": epoch,
-        "training_stage": schedule.name,
-        "dmc_state_dict": dmc.state_dict(),
-        "cloned_frontend_state_dict": criterion.cloned_frontend_state_dict(),
+        "training_stage": args.training_stage,
+        "dmc_state_dict": system.dmc.state_dict(),
+        "cloned_frontend_state_dict": system.objective.cloned_frontend_state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
-        "metrics": metrics,
-        "validation_metrics_by_qp": validation_metrics_by_qp,
-        "checkpoint_selection": checkpoint_selection,
-        "training_schedule": {
-            "pictures_per_group": schedule.num_frames,
-            "qp_offsets": schedule.qp_offsets,
-            "distortion_weights": schedule.distortion_weights,
+        "optimizer_steps": optimizer_steps,
+        "best_proxy_score": best_proxy_score,
+        "train_metrics": train_metrics,
+        "validation_metrics": validation.mean if validation else None,
+        "validation_metrics_by_qp": validation.by_qp if validation else None,
+        "validation_proxy_score": validation.proxy_score if validation else None,
+        "rng_states": rng_states,
+        "epoch_history": list(epoch_history),
+        "protocol": {
+            "training_scope": "DMC plus cloned YOLO layers 0..4",
+            "frozen": ["DCVC-RT DMCI", "YOLO teacher", "YOLO task backend"],
+            "colour": "full-range BT.709 YCbCr 4:4:4 inside codec; RGB inside YOLO",
+            "objective": "estimated_bpp + lambda_feature * multi_level_feature_mse",
+            "gaussian_rate_scale_domain": "coder table [0.11,16], 128 log levels",
+            "codec_training_implementation": "autograd-safe PyTorch path",
+            "base_qp_sampling": "uniform integer [0, 63] per rank and batch",
+            "qp_offsets": QP_OFFSETS,
+            "lambda_min": args.lambda_min,
+            "lambda_max": args.lambda_max,
+            "lambda_scale": args.lambda_scale,
+            "validation_qps": tuple(args.validation_qps),
+            "tbptt_steps": args.tbptt_steps,
+            "vimeo_curriculum_frames": tuple(args.vimeo_curriculum_frames),
+            "vimeo_curriculum_start_epochs": tuple(
+                args.vimeo_curriculum_start_epochs
+            ),
         },
-        "training_curriculum": {
-            "active_num_frames": active_num_frames,
-            "vimeo_frame_counts": tuple(args.vimeo_curriculum_frames),
-            "vimeo_start_epochs": tuple(args.vimeo_curriculum_start_epochs),
-        },
-        "training_state": {
-            "best_loss": best_loss,
-            "stale_validations": stale_validations,
-            "active_num_frames": active_num_frames,
+        "feature_objective": {
+            "task_model": args.task_model,
+            "layer_indices": system.objective.feature_layer_indices,
+            "topology": system.objective.feature_topology,
+            "cloned_frontend_last_layer": (
+                system.objective.cloned_frontend_last_layer
+            ),
+            "frozen_task_backend_layers": "5..23 plus Detect",
+            "normalized_layer_weights": system.objective.layer_weights.detach().cpu().tolist(),
+            "teacher_frontend": "frozen_pretrained",
+            "reconstruction_frontend": (
+                "jointly_trainable_clone"
+                if system.objective.train_cloned_frontend
+                else "frozen_clone_ablation"
+            ),
+            "batch_norm_statistics": "frozen",
+            "inspiration": "TransTIC multi-level FPN feature distortion",
         },
         "optimizer_config": {
             "name": "AdamW",
             "learning_rate": args.learning_rate,
             "frontend_learning_rate": args.frontend_learning_rate,
             "weight_decay": args.weight_decay,
-            "quantization_and_bias_weight_decay": 0.0,
-            "train_cloned_frontend": criterion.train_cloned_frontend,
+            "train_cloned_frontend": system.objective.train_cloned_frontend,
+            "accumulation_steps": args.accumulation_steps,
+            "grad_clip": args.grad_clip,
+            "lr_milestones": tuple(args.lr_milestones),
+            "lr_gamma": args.lr_gamma,
         },
-        "feature_objective": {
-            "task_model": args.task_model,
-            "layer_indices": criterion.feature_layer_indices,
-            "last_backbone_layer": criterion.last_backbone_layer,
-            "normalized_layer_weights": criterion.layer_weights.detach()
-            .cpu()
-            .tolist(),
-            "teacher_frontend": "frozen_pretrained",
-            "reconstruction_frontend": (
-                "jointly_trainable_clone"
-                if criterion.train_cloned_frontend
-                else "frozen_clone_ablation"
+        "source_checkpoints": {
+            "image_checkpoint_sha256": sha256_file(args.image_checkpoint),
+            "video_initialization_sha256": (
+                sha256_file(args.video_init) if args.video_init else None
             ),
-            "batch_norm_statistics": "frozen",
+            "yolov5_weights_sha256": (
+                sha256_file(args.yolov5_weights) if args.yolov5_weights else None
+            ),
         },
     }
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, temporary_path)
-    temporary_path.replace(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def restore_training(
+    path: str | None,
+    system: VideoVCMSystem,
+    optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.LRScheduler,
+    context: DistributedContext,
+    args: argparse.Namespace,
+) -> RestoredState:
+    if path is None:
+        return RestoredState()
+    # Keep serialized RNG byte tensors on CPU; module/optimizer loaders move
+    # parameter state to the appropriate device.
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if checkpoint.get("schema_version") != 12:
+        raise ValueError("Only schema-12 checkpoints can be resumed; use --video-init otherwise")
+    if checkpoint.get("training_stage") != args.training_stage:
+        raise ValueError("Resume checkpoint training stage does not match --training-stage")
+    saved_protocol = checkpoint.get("protocol", {})
+    expected_protocol = {
+        "lambda_min": args.lambda_min,
+        "lambda_max": args.lambda_max,
+        "lambda_scale": args.lambda_scale,
+        "validation_qps": tuple(args.validation_qps),
+        "tbptt_steps": args.tbptt_steps,
+        "vimeo_curriculum_frames": tuple(args.vimeo_curriculum_frames),
+        "vimeo_curriculum_start_epochs": tuple(
+            args.vimeo_curriculum_start_epochs
+        ),
+    }
+    for key, expected in expected_protocol.items():
+        saved = saved_protocol.get(key)
+        if saved is not None and saved != expected:
+            raise ValueError(
+                f"Resume checkpoint {key}={saved!r} does not match current {expected!r}"
+            )
+    saved_feature = checkpoint.get("feature_objective", {})
+    if tuple(saved_feature.get("layer_indices", ())) != system.objective.feature_layer_indices:
+        raise ValueError("Resume checkpoint feature layers do not match current settings")
+    if int(saved_feature.get("cloned_frontend_last_layer", -1)) != (
+        system.objective.cloned_frontend_last_layer
+    ):
+        raise ValueError("Resume checkpoint cloned front-end topology does not match")
+    saved_weights = tuple(saved_feature.get("normalized_layer_weights", ()))
+    current_weights = tuple(system.objective.layer_weights.detach().cpu().tolist())
+    if len(saved_weights) != len(current_weights) or any(
+        not math.isclose(float(saved), float(current), rel_tol=1e-7, abs_tol=1e-9)
+        for saved, current in zip(saved_weights, current_weights)
+    ):
+        raise ValueError("Resume checkpoint feature-layer weights do not match")
+    saved_optimizer = checkpoint.get("optimizer_config", {})
+    if bool(saved_optimizer.get("train_cloned_frontend")) != system.objective.train_cloned_frontend:
+        raise ValueError("Resume checkpoint cloned-front-end setting does not match")
+    expected_optimizer = {
+        "learning_rate": args.learning_rate,
+        "frontend_learning_rate": args.frontend_learning_rate,
+        "weight_decay": args.weight_decay,
+        "accumulation_steps": args.accumulation_steps,
+        "grad_clip": args.grad_clip,
+        "lr_milestones": tuple(args.lr_milestones),
+        "lr_gamma": args.lr_gamma,
+    }
+    for key, expected in expected_optimizer.items():
+        saved = saved_optimizer.get(key)
+        if isinstance(expected, tuple) and saved is not None:
+            saved = tuple(saved)
+        if saved is not None and saved != expected:
+            raise ValueError(
+                f"Resume checkpoint optimizer {key}={saved!r} does not match "
+                f"current {expected!r}"
+            )
+    saved_image_hash = checkpoint.get("source_checkpoints", {}).get(
+        "image_checkpoint_sha256"
+    )
+    if saved_image_hash and saved_image_hash != sha256_file(args.image_checkpoint):
+        raise ValueError("Resume checkpoint was created with a different DMCI checkpoint")
+    system.dmc.load_state_dict(checkpoint["dmc_state_dict"], strict=True)
+    system.objective.load_cloned_frontend_state_dict(
+        checkpoint["cloned_frontend_state_dict"]
+    )
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    restore_rng_state(checkpoint.get("rng_states"), context)
+    return RestoredState(
+        start_epoch=int(checkpoint["epoch"]) + 1,
+        best_proxy_score=float(checkpoint.get("best_proxy_score", float("inf"))),
+        optimizer_steps=int(checkpoint.get("optimizer_steps", 0)),
+        epoch_history=tuple(checkpoint.get("epoch_history", ())),
+    )
 
 
 def copy_checkpoint(source: Path, destination: Path) -> None:
-    """Atomically copy an already serialized checkpoint."""
-    temporary_path = destination.with_suffix(destination.suffix + ".tmp")
-    shutil.copy2(source, temporary_path)
-    temporary_path.replace(destination)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    shutil.copy2(source, temporary)
+    temporary.replace(destination)
 
 
 def prune_periodic_checkpoints(directory: Path, keep: int) -> None:
-    """Keep only the newest ``keep`` files named ``epoch_<number>.pt``."""
-    if keep < 0:
-        raise ValueError("keep_periodic_checkpoints must be non-negative")
-    checkpoints = []
+    checkpoints: list[tuple[int, Path]] = []
     for path in directory.glob("epoch_*.pt"):
         match = re.fullmatch(r"epoch_(\d+)\.pt", path.name)
         if match:
@@ -627,453 +904,496 @@ def prune_periodic_checkpoints(directory: Path, keep: int) -> None:
         path.unlink()
 
 
-def train(args: argparse.Namespace):
-    args.training_stage = TRAINING_STAGE_ALIASES.get(
-        args.training_stage,
-        args.training_stage,
-    )
-    args.validation_qps = resolve_validation_qps(args)
-    if args.crop_size % 16:
-        raise ValueError("crop_size must be divisible by 16 for DCVC-RT")
-    if args.weight_decay < 0:
-        raise ValueError("weight_decay must be non-negative")
-    if args.frontend_learning_rate is None:
-        args.frontend_learning_rate = args.learning_rate
-    if args.frontend_learning_rate <= 0:
-        raise ValueError("frontend_learning_rate must be positive")
-    if args.validate_every < 1:
-        raise ValueError("validate_every must be at least 1")
-    if args.save_every < 0:
-        raise ValueError("save_every must be non-negative")
-    if args.keep_periodic_checkpoints < 0:
-        raise ValueError("keep_periodic_checkpoints must be non-negative")
-    if args.max_batches is not None and args.max_batches < 1:
-        raise ValueError("max_batches must be at least 1")
-    if (
-        args.val_dir
-        and args.max_validation_batches is not None
-        and args.max_validation_batches < 1
-    ):
-        raise ValueError("max_validation_batches must be at least 1")
-    if args.grad_clip <= 0:
-        raise ValueError("grad_clip must be positive")
-    schedule = get_training_schedule(args.training_stage)
+def validate_args(args: argparse.Namespace) -> None:
+    schedule = get_schedule(args.training_stage)
     if args.resume and args.video_init:
         raise ValueError("Use --resume or --video-init, not both")
-    if args.training_stage == "reds8" and not (args.video_init or args.resume):
-        raise ValueError(
-            "Stage reds8 is fine-tuning and requires the Vimeo7 checkpoint via "
-            "--video-init (or --resume for an interrupted reds8 run)"
-        )
-    interpolate_lambda(0, args.lambda_min, args.lambda_max)
+    if not args.resume and not args.video_init:
+        raise ValueError("A new run requires --video-init with pretrained DCVC-RT DMC weights")
+    if not Path(args.image_checkpoint).is_file():
+        raise FileNotFoundError(f"Image checkpoint not found: {args.image_checkpoint}")
+    if args.crop_size % 16:
+        raise ValueError("crop_size must be divisible by 16")
+    if args.batch_size_per_gpu != 1:
+        raise ValueError("DCVC-RT sequence training currently requires batch_size_per_gpu=1")
+    if args.accumulation_steps < 1 or args.tbptt_steps < 0:
+        raise ValueError("accumulation_steps must be positive and tbptt_steps non-negative")
+    if args.learning_rate <= 0 or args.frontend_learning_rate <= 0:
+        raise ValueError("learning rates must be positive")
+    if args.weight_decay < 0 or args.grad_clip <= 0:
+        raise ValueError("weight_decay must be non-negative and grad_clip positive")
+    if not args.lr_milestones or any(epoch < 1 for epoch in args.lr_milestones):
+        raise ValueError("lr_milestones must contain positive epoch numbers")
+    if tuple(sorted(set(args.lr_milestones))) != tuple(args.lr_milestones):
+        raise ValueError("lr_milestones must be unique and strictly increasing")
+    if not 0 < args.lr_gamma <= 1:
+        raise ValueError("lr_gamma must be in (0, 1]")
+    if args.epochs < 1 or args.validate_every < 1:
+        raise ValueError("epochs and validate_every must be positive")
+    if args.save_every < 0 or args.keep_periodic_checkpoints < 0:
+        raise ValueError("save_every and keep_periodic_checkpoints must be non-negative")
+    if args.log_every < 1:
+        raise ValueError("log_every must be positive")
+    if len(args.validation_qps) != 4 or len(set(args.validation_qps)) != 4:
+        raise ValueError("Exactly four distinct validation QPs are required")
+    if any(not 0 <= qp <= 63 for qp in args.validation_qps):
+        raise ValueError("Validation QPs must be in [0, 63]")
+    if args.max_batches is not None and args.max_batches < 1:
+        raise ValueError("max_batches must be positive")
+    if args.max_validation_batches is not None and args.max_validation_batches < 1:
+        raise ValueError("max_validation_batches must be positive")
+    interpolate_lambda(0, args.lambda_min, args.lambda_max, args.lambda_scale)
     get_epoch_num_frames(args, 1)
+    if schedule.name == "reds8" and not (args.video_init or args.resume):
+        raise ValueError("REDS fine-tuning requires a video initialization")
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader = make_loader(args, args.data_dir, args.train_list, shuffle=True)
-    validation_loader = (
-        make_loader(args, args.val_dir, args.val_list, shuffle=False)
-        if args.val_dir
-        else None
-    )
-    checkpoint_selection = {
-        "metric": (
-            "mean_validation_total_loss_over_qps"
-            if validation_loader is not None
-            else "mean_training_total_loss"
-        ),
-        "validation_qps": (
-            tuple(args.validation_qps) if validation_loader is not None else ()
-        ),
-    }
-    print(
-        f"stage={schedule.name}, frames={schedule.num_frames}, "
-        f"train_samples={len(train_loader.dataset)}, "
-        f"qp_offsets={list(schedule.qp_offsets)}"
-    )
-
-    dmc = DMC().to(device)
-    criterion = VCMLoss(
-        args.task_model,
-        args.feature_layer_indices,
-        args.feature_layer_weights,
-        yolov5_repository=args.yolov5_repo,
-        yolov5_weights=args.yolov5_weights,
-        train_cloned_frontend=args.train_cloned_frontend,
-    ).to(device)
-    if args.video_init:
-        load_initial_weights(dmc, criterion, args.video_init, device)
-    metric_names = (*METRICS, *criterion.layer_metric_names)
-    optimizer = make_optimizer(
-        dmc,
-        criterion,
-        args.learning_rate,
-        args.frontend_learning_rate,
-        args.weight_decay,
-    )
-    trainable_parameters = [
-        parameter
-        for group in optimizer.param_groups
-        for parameter in group["params"]
-    ]
-    trainable_dmc = sum(
-        parameter.numel() for parameter in dmc.parameters() if parameter.requires_grad
-    )
-    trainable_frontend = sum(
-        parameter.numel()
-        for parameter in criterion.reconstruction_extractor.parameters()
-        if parameter.requires_grad
-    )
-    print(
-        f"trainable parameters: DMC={trainable_dmc:,}, "
-        f"cloned_yolo_frontend={trainable_frontend:,}"
-    )
-    scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=args.lr_milestones,
-        gamma=args.lr_gamma,
-    )
-    restored_state = restore(
-        args.resume,
-        dmc,
-        criterion,
-        optimizer,
-        scheduler,
-        device,
-        args.training_stage,
-        checkpoint_selection,
-    )
-
-    checkpoint_dir = Path(
-        args.checkpoint_dir or f"checkpoints/vcm_{args.training_stage}"
-    )
-    args.checkpoint_dir = str(checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    logger = TrainingLogger(checkpoint_dir / "logs", args, metric_names)
-    best_loss = restored_state.best_loss
-    stale_validations = restored_state.stale_validations
-    previous_active_num_frames = restored_state.active_num_frames
-    latest_checkpoint = checkpoint_dir / "latest.pt"
+def run_training(args: argparse.Namespace) -> None:
+    validate_args(args)
+    context = init_distributed()
+    logger: TrainingLogger | None = None
     try:
-        for epoch in range(restored_state.start_epoch, args.epochs + 1):
-            active_num_frames = get_epoch_num_frames(args, epoch)
-            phase_changed = active_num_frames != previous_active_num_frames
-            if phase_changed:
-                best_loss = float("inf")
-                stale_validations = 0
-                previous_active_num_frames = active_num_frames
-            train_loader.dataset.set_num_frames(active_num_frames)
-            dmc.train()
-            criterion.train()
-            epoch_entries = []
-            skipped_batches = 0
-            progress = tqdm(
-                train_loader,
-                desc=(
-                    f"epoch {epoch}/{args.epochs} "
-                    f"({active_num_frames} frames)"
-                ),
-            )
-            for batch_index, frames in enumerate(progress):
-                if args.max_batches is not None and batch_index >= args.max_batches:
-                    break
-                optimizer.zero_grad(set_to_none=True)
-                base_qp = random.randint(0, 63)
-                loss, details = run_gop(
-                    dmc,
-                    criterion,
-                    frames.to(device, non_blocking=True),
-                    base_qp,
-                    args,
-                )
-                if not torch.isfinite(loss):
-                    skipped_batches += 1
-                    optimizer.zero_grad(set_to_none=True)
-                    progress.set_postfix(status="skip non-finite loss")
-                    continue
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    trainable_parameters,
-                    args.grad_clip,
-                )
-                if not torch.isfinite(grad_norm):
-                    skipped_batches += 1
-                    optimizer.zero_grad(set_to_none=True)
-                    progress.set_postfix(status="skip non-finite gradient")
-                    continue
-                optimizer.step()
-                detached_details = {
-                    key: value.detach() for key, value in details.items()
-                }
-                epoch_entries.append(detached_details)
-                progress.set_postfix(
-                    loss=f"{float(loss.detach()):.5f}",
-                    bpp=f"{float(details['estimated_bpp'].detach()):.5f}",
-                )
+        seed_everything(args.seed, context.rank, args.deterministic)
+        if context.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(context.device)
 
-            train_metrics = aggregate(epoch_entries)
-            should_validate = validation_loader is not None and (
-                phase_changed
-                or epoch % args.validate_every == 0
-                or epoch == args.epochs
-            )
-            validation_result = (
-                validate(dmc, criterion, validation_loader, args, device)
-                if should_validate
-                else None
-            )
-            val_metrics = (
-                validation_result.mean if validation_result is not None else None
-            )
-            val_metrics_by_qp = (
-                validation_result.by_qp if validation_result is not None else None
-            )
-            epoch_learning_rate = optimizer.param_groups[0]["lr"]
-            scheduler.step()
-            logger.log(
-                epoch,
-                epoch_learning_rate,
-                train_metrics,
-                val_metrics,
-                val_metrics_by_qp,
+        train_loader, train_sampler = make_loader(
+            args, context, args.data_dir, args.train_list, training=True
+        )
+        validation_loader = None
+        if context.is_main and args.val_dir:
+            validation_loader, _ = make_loader(
+                args, context, args.val_dir, args.val_list, training=False
             )
 
-            print(
-                f"epoch {epoch}: loss={train_metrics['total_loss']:.6f}, "
-                f"bpp={train_metrics['estimated_bpp']:.6f}, "
-                f"feature_mse={train_metrics['feature_mse']:.8f}, "
-                f"mean_base_qp={train_metrics['base_qp']:.2f}, "
-                f"skipped_batches={skipped_batches}"
-            )
-            if val_metrics is not None:
-                print(
-                    f"validation mean qps={list(args.validation_qps)}: "
-                    f"loss={val_metrics['total_loss']:.6f}, "
-                    f"bpp={val_metrics['estimated_bpp']:.6f}, "
-                    f"feature_mse={val_metrics['feature_mse']:.8f}"
-                )
-                for validation_qp, qp_metrics in val_metrics_by_qp.items():
-                    print(
-                        f"  qp {validation_qp}: "
-                        f"loss={qp_metrics['total_loss']:.6f}, "
-                        f"bpp={qp_metrics['estimated_bpp']:.6f}, "
-                        f"feature_mse={qp_metrics['feature_mse']:.8f}"
-                    )
-            selection_metrics = (
-                val_metrics
-                if validation_loader is not None
-                else train_metrics
-            )
-            improved = (
-                selection_metrics is not None
-                and selection_metrics["total_loss"] < best_loss
-            )
-            should_stop = False
-            if improved:
-                best_loss = selection_metrics["total_loss"]
-                stale_validations = 0
-            elif selection_metrics is not None:
-                stale_validations += 1
-                curriculum_complete = (
-                    args.training_stage != "vimeo7"
-                    or active_num_frames == schedule.num_frames
-                )
-                if (
-                    curriculum_complete
-                    and args.patience
-                    and stale_validations >= args.patience
-                ):
-                    should_stop = True
+        image_model = DMCI()
+        load_image_weights(image_model, args.image_checkpoint)
+        objective = VCMLoss(
+            args.task_model,
+            args.feature_layer_indices,
+            args.feature_layer_weights,
+            yolov5_repository=args.yolov5_repo,
+            yolov5_weights=args.yolov5_weights,
+            train_cloned_frontend=args.train_cloned_frontend,
+            cloned_frontend_last_layer=args.cloned_frontend_last_layer,
+        )
+        system = VideoVCMSystem(image_model, DMC(), objective).to(context.device)
+        if args.video_init:
+            load_video_initialization(system, args.video_init)
 
-            checkpoint_metrics = selection_metrics or train_metrics
-            save_checkpoint(
-                latest_checkpoint,
-                epoch,
-                dmc,
-                criterion,
-                optimizer,
-                scheduler,
-                checkpoint_metrics,
-                val_metrics_by_qp,
-                schedule,
-                active_num_frames,
-                best_loss,
-                stale_validations,
+        optimizer = make_optimizer(system, args)
+        scheduler = optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=tuple(args.lr_milestones),
+            gamma=args.lr_gamma,
+        )
+        restored = restore_training(
+            args.resume,
+            system,
+            optimizer,
+            scheduler,
+            context,
+            args,
+        )
+        trainable_parameters = [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ]
+        dmc_parameters = [parameter for parameter in system.dmc.parameters() if parameter.requires_grad]
+        frontend_parameters = [
+            parameter
+            for parameter in system.objective.reconstruction_extractor.parameters()
+            if parameter.requires_grad
+        ]
+
+        if context.enabled:
+            find_unused_parameters = ddp_find_unused_parameters(args.tbptt_steps)
+            model: VideoVCMSystem | DDP = DDP(
+                system,
+                device_ids=[context.local_rank] if context.device.type == "cuda" else None,
+                output_device=context.local_rank if context.device.type == "cuda" else None,
+                broadcast_buffers=False,
+                find_unused_parameters=find_unused_parameters,
+            )
+        else:
+            model = system
+
+        checkpoint_dir = Path(args.checkpoint_dir)
+        if context.is_main:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            metric_names = (*FIXED_METRICS, *system.objective.layer_metric_names, "i_rgb_mse", "i_rgb_psnr")
+            logger = TrainingLogger(
+                checkpoint_dir / "logs",
                 args,
-                checkpoint_selection,
+                metric_names,
+                previous_history=restored.epoch_history,
             )
-            if improved:
-                copy_checkpoint(latest_checkpoint, checkpoint_dir / "best.pt")
-            if args.save_every and epoch % args.save_every == 0:
-                copy_checkpoint(
-                    latest_checkpoint,
-                    checkpoint_dir / f"epoch_{epoch}.pt",
+            run_config = {
+                **vars(args),
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "git_revision": git_revision(),
+                "world_size": context.world_size,
+                "effective_batch_size": (
+                    context.world_size
+                    * args.batch_size_per_gpu
+                    * args.accumulation_steps
+                ),
+                "qp_offsets": QP_OFFSETS,
+                "image_checkpoint_sha256": sha256_file(args.image_checkpoint),
+                "video_initialization_sha256": (
+                    sha256_file(args.video_init) if args.video_init else None
+                ),
+                "color_pipeline": "RGB -> full-range BT.709 YCbCr444 -> codec -> RGB -> YOLO",
+                "codec_training_implementation": "autograd-safe PyTorch path",
+                "custom_cuda_inference_disabled": True,
+                "gaussian_rate_scale_domain": "coder table [0.11,16], 128 log levels",
+                "ddp_find_unused_parameters": ddp_find_unused_parameters(
+                    args.tbptt_steps
+                ),
+                "feature_topology": system.objective.feature_topology,
+                "cloned_frontend_layers": (
+                    f"0..{system.objective.cloned_frontend_last_layer}"
+                ),
+            }
+            (checkpoint_dir / "run_config.json").write_text(
+                json.dumps(run_config, indent=2), encoding="utf-8"
+            )
+            print(
+                f"stage={args.training_stage}, world_size={context.world_size}, "
+                f"train_samples={len(train_loader.dataset)}, effective_batch="
+                f"{run_config['effective_batch_size']}, qp_offsets={list(QP_OFFSETS)}"
+            )
+
+        best_proxy_score = restored.best_proxy_score
+        optimizer_steps = restored.optimizer_steps
+        latest_path = checkpoint_dir / "latest.pt"
+        for epoch in range(restored.start_epoch, args.epochs + 1):
+            epoch_start = time.perf_counter()
+            active_num_frames = get_epoch_num_frames(args, epoch)
+            train_loader.dataset.set_num_frames(active_num_frames)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            metric_sums: dict[str, float] = {}
+            valid_batches = 0
+            skipped_batches = 0
+            micro_in_window = 0
+            grad_norms: list[float] = []
+            dmc_grad_norms: list[float] = []
+            frontend_grad_norms: list[float] = []
+            total_batches = len(train_loader)
+            if args.max_batches is not None:
+                total_batches = min(total_batches, args.max_batches)
+            progress = tqdm(
+                total=total_batches,
+                desc=f"epoch {epoch}/{args.epochs} ({active_num_frames} frames)",
+                disable=not context.is_main,
+            )
+            for batch_index, frames in enumerate(train_loader):
+                if batch_index >= total_batches:
+                    break
+                is_last_batch = batch_index + 1 == total_batches
+                will_step = micro_in_window + 1 >= args.accumulation_steps or is_last_batch
+                base_qp = random.randint(0, 63)
+                lambda_feature = interpolate_lambda(
+                    base_qp,
+                    args.lambda_min,
+                    args.lambda_max,
+                    args.lambda_scale,
                 )
-                prune_periodic_checkpoints(
-                    checkpoint_dir,
-                    args.keep_periodic_checkpoints,
+                valid, details = train_gop(
+                    model,
+                    frames.to(context.device, non_blocking=True),
+                    base_qp,
+                    lambda_feature,
+                    args,
+                    context,
+                    synchronize_last_chunk=will_step,
                 )
-            if should_stop:
+                if not valid or details is None:
+                    skipped_batches += 1
+                    micro_in_window = 0
+                    optimizer.zero_grad(set_to_none=True)
+                    progress.update(1)
+                    continue
+
+                valid_batches += 1
+                micro_in_window += 1
+                for key, value in details.items():
+                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value.detach())
+
+                if will_step:
+                    if micro_in_window < args.accumulation_steps:
+                        correction = args.accumulation_steps / micro_in_window
+                        for parameter in trainable_parameters:
+                            if parameter.grad is not None:
+                                parameter.grad.mul_(correction)
+                    dmc_norm = parameter_grad_norm(dmc_parameters)
+                    frontend_norm = parameter_grad_norm(frontend_parameters)
+                    total_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                        trainable_parameters,
+                        args.grad_clip,
+                        error_if_nonfinite=False,
+                    )
+                    gradients_finite = global_boolean(
+                        bool(torch.isfinite(total_norm_tensor)), context
+                    )
+                    if gradients_finite:
+                        optimizer.step()
+                        optimizer_steps += 1
+                        total_norm = float(total_norm_tensor)
+                        grad_norms.append(total_norm)
+                        dmc_grad_norms.append(dmc_norm)
+                        frontend_grad_norms.append(frontend_norm)
+                        if (
+                            context.is_main
+                            and logger is not None
+                            and optimizer_steps % args.log_every == 0
+                        ):
+                            logger.log_batch(
+                                {
+                                    "epoch": epoch,
+                                    "batch_index": batch_index,
+                                    "optimizer_step": optimizer_steps,
+                                    "active_num_frames": active_num_frames,
+                                    "base_qp": base_qp,
+                                    "lambda_feature": lambda_feature,
+                                    "loss": float(details["total_loss"].detach()),
+                                    "estimated_bpp": float(details["estimated_bpp"].detach()),
+                                    "feature_mse": float(details["feature_mse"].detach()),
+                                    "rgb_psnr": float(details["rgb_psnr"].detach()),
+                                    "grad_norm_pre_clip": total_norm,
+                                    "dmc_grad_norm": dmc_norm,
+                                    "frontend_grad_norm": frontend_norm,
+                                }
+                            )
+                    else:
+                        skipped_batches += micro_in_window
+                    optimizer.zero_grad(set_to_none=True)
+                    micro_in_window = 0
+
+                progress.set_postfix(
+                    loss=f"{float(details['total_loss'].detach()):.4f}",
+                    bpp=f"{float(details['estimated_bpp'].detach()):.4f}",
+                    qp=base_qp,
+                )
+                progress.update(1)
+            progress.close()
+
+            train_metrics = reduce_metrics(metric_sums, valid_batches, context)
+            skipped_tensor = torch.tensor(skipped_batches, device=context.device)
+            if context.enabled:
+                # Invalidity is synchronized before backward, so every rank
+                # skips the same logical batch; do not multiply by world size.
+                dist.all_reduce(skipped_tensor, op=dist.ReduceOp.MAX)
+            skipped_total = int(skipped_tensor.item())
+            if context.enabled:
+                dist.barrier()
+
+            validation = None
+            should_validate = (
+                validation_loader is not None
+                and (epoch % args.validate_every == 0 or epoch == args.epochs)
+            )
+            if context.is_main and should_validate:
+                validation = validate(system, validation_loader, args, context.device)
+            if context.enabled:
+                dist.barrier()
+
+            epoch_dmc_lr = next(
+                group["lr"] for group in optimizer.param_groups if group["source"] == "dmc"
+            )
+            epoch_frontend_lr = next(
+                (
+                    group["lr"]
+                    for group in optimizer.param_groups
+                    if group["source"] == "cloned_frontend"
+                ),
+                0.0,
+            )
+            scheduler.step()
+            rng_states = gather_rng_states(context)
+            epoch_seconds = time.perf_counter() - epoch_start
+            if context.is_main:
+                proxy_score = (
+                    validation.proxy_score
+                    if validation is not None
+                    else float(train_metrics["total_loss"])
+                )
+                improved = validation is not None and proxy_score < best_proxy_score
+                if improved:
+                    best_proxy_score = proxy_score
+                peak_memory = (
+                    torch.cuda.max_memory_allocated(context.device) / 2**20
+                    if context.device.type == "cuda"
+                    else 0.0
+                )
+                epoch_metadata = {
+                    "epoch": epoch,
+                    "active_num_frames": active_num_frames,
+                    "optimizer_steps": optimizer_steps,
+                    "dmc_learning_rate": epoch_dmc_lr,
+                    "frontend_learning_rate": epoch_frontend_lr,
+                    "proxy_score": proxy_score,
+                    "grad_norm": sum(grad_norms) / len(grad_norms) if grad_norms else 0.0,
+                    "dmc_grad_norm": (
+                        sum(dmc_grad_norms) / len(dmc_grad_norms) if dmc_grad_norms else 0.0
+                    ),
+                    "frontend_grad_norm": (
+                        sum(frontend_grad_norms) / len(frontend_grad_norms)
+                        if frontend_grad_norms
+                        else 0.0
+                    ),
+                    "skipped_batches": skipped_total,
+                    "epoch_seconds": epoch_seconds,
+                    "gpu_peak_memory_mib": peak_memory,
+                }
+                assert logger is not None
+                logger.log_epoch(epoch_metadata, train_metrics, validation)
+                save_checkpoint(
+                    latest_path,
+                    epoch,
+                    system,
+                    optimizer,
+                    scheduler,
+                    args,
+                    train_metrics,
+                    validation,
+                    best_proxy_score,
+                    optimizer_steps,
+                    rng_states,
+                    logger.history,
+                )
+                if improved:
+                    copy_checkpoint(latest_path, checkpoint_dir / "best_proxy.pt")
+                if args.save_every and epoch % args.save_every == 0:
+                    copy_checkpoint(latest_path, checkpoint_dir / f"epoch_{epoch}.pt")
+                    prune_periodic_checkpoints(checkpoint_dir, args.keep_periodic_checkpoints)
                 print(
-                    "Early stopping after "
-                    f"{args.patience} non-improving validation checks."
+                    f"epoch {epoch}: loss={train_metrics['total_loss']:.6f}, "
+                    f"bpp={train_metrics['estimated_bpp']:.6f}, "
+                    f"feature={train_metrics['feature_mse']:.6f}, "
+                    f"rgb_psnr={train_metrics['rgb_psnr']:.3f}, "
+                    f"proxy={proxy_score:.6f}, skipped={skipped_total}"
                 )
-                break
+                if validation is not None:
+                    for qp, metrics in validation.by_qp.items():
+                        print(
+                            f"  val qp={qp}: bpp={metrics['estimated_bpp']:.6f}, "
+                            f"feature={metrics['feature_mse']:.6f}, "
+                            f"rgb_psnr={metrics['rgb_psnr']:.3f}"
+                        )
+                if context.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(context.device)
+            if context.enabled:
+                # Rank 0 can spend noticeable time writing a large atomic
+                # checkpoint. Keep all ranks aligned before the next epoch or
+                # process-group teardown.
+                dist.barrier()
     finally:
-        logger.close()
+        if logger is not None:
+            logger.close()
+        cleanup_distributed(context)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--training-stage", choices=("vimeo7", "reds8"), default="vimeo7")
+    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--train-list")
+    parser.add_argument("--val-dir")
+    parser.add_argument("--val-list")
+    parser.add_argument("--image-checkpoint", required=True)
+    parser.add_argument("--video-init")
+    parser.add_argument("--resume")
+    parser.add_argument("--checkpoint-dir", default="checkpoints/vcm_vimeo7")
+    parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument(
-        "--training-stage",
-        choices=("vimeo7", "reds8", "long8"),
-        default="vimeo7",
-        help=(
-            "vimeo7: initial Vimeo-90K training; reds8: REDS sharp-sequence "
-            "fine-tuning; long8 is a deprecated alias for reds8"
-        ),
-    )
-    parser.add_argument(
-        "--data-dir",
-        required=True,
-        help="Vimeo-90K sequences directory or REDS train_sharp/val_sharp root",
-    )
-    parser.add_argument("--val-dir", help="Optional validation frame-sequence directory")
-    parser.add_argument("--train-list", help="Sequence list relative to data-dir (or an absolute path)")
-    parser.add_argument("--val-list", help="Sequence list relative to val-dir (or an absolute path)")
-    parser.add_argument(
-        "--checkpoint-dir",
-        help="Defaults to checkpoints/vcm_<training-stage>",
-    )
-    parser.add_argument("--video-init", help="Optional pretrained DMC checkpoint; no image checkpoint is used")
-    parser.add_argument("--resume", help="Resume a checkpoint produced by this script")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--crop-size", type=int, default=256)
-    parser.add_argument(
-        "--samples-per-sequence",
+        "--batch-size-per-gpu",
+        "--batch-size",
+        dest="batch_size_per_gpu",
         type=int,
         default=1,
-        help="Random temporal crops drawn per sequence per training epoch",
     )
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--accumulation-steps", type=int, default=4)
     parser.add_argument(
-        "--frontend-learning-rate",
-        type=float,
-        help=(
-            "Learning rate for the cloned YOLO front end; defaults to "
-            "--learning-rate"
-        ),
+        "--tbptt-steps",
+        type=int,
+        default=0,
+        help="0 keeps the complete temporal graph; use 2 or 3 only if memory requires truncation",
     )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-4,
-        help="AdamW decay; quantization controls, biases and 1-D scales use zero",
-    )
-    parser.add_argument("--lr-milestones", type=int, nargs="+", default=(60, 80))
-    parser.add_argument("--lr-gamma", type=float, default=0.1)
+    parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--samples-per-sequence", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--frontend-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--lr-milestones", type=int, nargs="+", default=(8, 12))
+    parser.add_argument("--lr-gamma", type=float, default=0.2)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--lambda-min", type=float, default=1.0)
     parser.add_argument("--lambda-max", type=float, default=768.0)
+    parser.add_argument(
+        "--lambda-scale",
+        type=float,
+        default=0.006,
+        help=(
+            "Feature-loss calibration multiplier; rerun the 0.003/0.006/0.01 "
+            "pilot for the selected feature topology before the final run"
+        ),
+    )
     parser.add_argument(
         "--vimeo-curriculum-frames",
         type=int,
         nargs="+",
-        default=DEFAULT_VIMEO_CURRICULUM_FRAMES,
-        help="Increasing Vimeo7 temporal crop lengths; must end at 7",
+        default=DEFAULT_CURRICULUM_FRAMES,
     )
     parser.add_argument(
         "--vimeo-curriculum-start-epochs",
         type=int,
         nargs="+",
-        default=DEFAULT_VIMEO_CURRICULUM_START_EPOCHS,
-        help="Epoch where each Vimeo7 temporal crop length becomes active",
+        default=DEFAULT_CURRICULUM_START_EPOCHS,
     )
     parser.add_argument(
         "--validation-qps",
         type=int,
-        nargs="+",
-        help=(
-            "Base QPs used for checkpoint validation (default: 0 21 42 63); "
-            "best.pt minimizes mean estimated rate + Feature MSE across them"
-        ),
+        nargs=4,
+        default=DEFAULT_VALIDATION_QPS,
+        metavar=("QP1", "QP2", "QP3", "QP4"),
     )
-    parser.add_argument(
-        "--validation-qp",
-        type=int,
-        choices=range(64),
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--validate-every",
-        type=int,
-        default=5,
-        help="Run validation every N epochs and at each curriculum transition",
-    )
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--validate-every", type=int, default=1)
+    parser.add_argument("--max-validation-batches", type=int, default=25)
     parser.add_argument("--max-batches", type=int)
-    parser.add_argument(
-        "--max-validation-batches",
-        type=int,
-        default=25,
-        help=(
-            "Number of deterministic clips per validation check; every clip is "
-            "evaluated at each --validation-qps point"
-        ),
-    )
-    parser.add_argument(
-        "--save-every",
-        type=int,
-        default=10,
-        help="Save epoch_N.pt every N epochs; 0 disables periodic snapshots",
-    )
-    parser.add_argument(
-        "--keep-periodic-checkpoints",
-        type=int,
-        default=2,
-        help="Number of newest epoch_N.pt snapshots to retain",
-    )
+    parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--keep-periodic-checkpoints", type=int, default=3)
+    parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--task-model", default="yolov5s")
-    parser.add_argument(
-        "--train-cloned-frontend",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Jointly optimize the cloned YOLO front end with DMC (default); "
-            "use --no-train-cloned-frontend only for the frozen-feature ablation"
-        ),
-    )
-    parser.add_argument(
-        "--yolov5-repo",
-        help="Optional local YOLOv5 v7 repository for Kaggle offline training",
-    )
-    parser.add_argument(
-        "--yolov5-weights",
-        help="Optional local YOLOv5 .pt weights; pairs with --yolov5-repo offline",
-    )
+    parser.add_argument("--yolov5-repo")
+    parser.add_argument("--yolov5-weights")
     parser.add_argument(
         "--feature-layer-indices",
         type=int,
         nargs="+",
         default=DEFAULT_FEATURE_LAYER_INDICES,
-        help="Ascending YOLOv5 backbone layers used for multi-level Feature MSE",
     )
     parser.add_argument(
-        "--feature-layer-weights",
-        type=float,
-        nargs="+",
-        help="Positive per-layer weights; defaults to equal and is normalized to sum to one",
+        "--cloned-frontend-last-layer",
+        type=int,
+        default=DEFAULT_CLONED_FRONTEND_LAST_LAYER,
+        help="Keep 4 for the five-layer Learned Scalable front-end protocol",
+    )
+    parser.add_argument("--feature-layer-weights", type=float, nargs="+")
+    parser.add_argument(
+        "--train-cloned-frontend",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--deterministic", action="store_true")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    run_training(parse_args())

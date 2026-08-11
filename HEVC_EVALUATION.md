@@ -1,124 +1,76 @@
-# HEVC HM evaluation for machine-oriented BD-rate
+# HEVC HM anchor cho BPP–mAP/BD-rate
 
-This evaluation path is independent from `train_vcm_final.py`. It does not
-change training weights, optimizer state, checkpoints, or the VCM loss.
+Anchor phải dùng đúng cùng sequence, frame count, ground truth, YOLO weights,
+input size, confidence/NMS thresholds và **all-frame protocol** với candidate.
 
-## Required tools
+## Source PNG/RGB
 
-- HEVC Test Model (HM) reference encoder, preferably HM-16.20 or HM-16.22.
-- A matching HM configuration such as `encoder_lowdelay_P_main.cfg`.
-- FFmpeg with PNG and raw YUV support.
-- The same annotated full-resolution manifest used by `evaluate_vcm.py`.
-
-Do not use NVENC as the reported HEVC reference anchor. Record the exact HM
-version and configuration file with the results.
-
-## Protocol choice
-
-The project codec is P-frame-only and receives frame 0 as an external seed.
-The matching HEVC mode is:
-
-```text
---protocol conditional-pframes
-```
-
-HM still encodes frame 0 so that it can reconstruct the following pictures.
-For the conditional comparison, `evaluate_hevc.py` excludes HM's reported POC
-0 picture bits and excludes frame 0 from mAP. Sequence-level HEVC headers
-remain counted. This result must be described as a conditional P-frame
-comparison; it is not the rate of a standalone independently decodable HEVC
-stream.
-
-Use:
-
-```text
---protocol all-frames
-```
-
-only when the candidate also transmits and counts its first frame.
-
-## Smoke test
+Theo test condition của Microsoft DCVC, traditional codec nên dùng YUV444 10-bit
+khi source là RGB. Cần HM RExt configuration, ví dụ
+`encoder_lowdelay_main_rext.cfg`:
 
 ```bash
 python evaluate_hevc.py \
-  --data-dir /path/to/vcm_eval \
+  --data-dir /data/vcm_eval \
   --dataset-manifest manifest.json \
-  --hm-encoder /path/to/HM/bin/TAppEncoderStatic \
-  --hm-config /path/to/HM/cfg/encoder_lowdelay_P_main.cfg \
-  --configuration-name "HM-16.22 Low-Delay P" \
-  --protocol conditional-pframes \
+  --hm-encoder /opt/HM/bin/TAppEncoderStatic \
+  --hm-config /opt/HM/cfg/encoder_lowdelay_main_rext.cfg \
+  --configuration-name "HM Low-Delay RGB444 10-bit" \
+  --protocol all-frames \
+  --chroma-format 444 \
+  --bit-depth 10 \
   --qps 22 27 32 37 \
-  --method-name "HEVC HM-16.22 LDP" \
-  --max-sequences 1 \
-  --output-dir output/hevc_smoke
+  --hm-extra-arg=--IntraPeriod=-1 \
+  --yolov5-repo /opt/yolov5 \
+  --yolov5-weights /weights/yolov5s.pt \
+  --method-name hevc_hm_rgb444
 ```
 
-Inspect the saved HM log. The evaluator deliberately fails when it cannot
-parse the POC 0 bit count required by the conditional protocol.
+Pipeline:
 
-## Full HEVC evaluation
+```text
+RGB PNG → BT.709 full-range YUV444 10-bit → HM → YUV444 → RGB → YOLO
+```
+
+HM bitstream được tính toàn bộ, bao gồm header và I-frame. mAP được tính trên
+mọi frame.
+
+## Source YUV420 thật
+
+Nếu test sequence gốc là YUV420, thiết lập chuẩn nhất là mã hóa trực tiếp file
+YUV420 gốc. Script hiện nhận frame manifest PNG để đồng bộ ground truth; chế độ
+`--chroma-format 420` chỉ hợp lệ khi các PNG được xác định rõ là representation
+của cùng source protocol. Không trộn kết quả RGB444 và YUV420 trong một phép
+BD-rate.
 
 ```bash
-python evaluate_hevc.py \
-  --data-dir /path/to/vcm_eval \
-  --dataset-manifest manifest.json \
-  --hm-encoder /path/to/HM/bin/TAppEncoderStatic \
-  --hm-config /path/to/HM/cfg/encoder_lowdelay_P_main.cfg \
-  --configuration-name "HM-16.22 Low-Delay P" \
-  --protocol conditional-pframes \
-  --qps 22 27 32 37 \
-  --method-name "HEVC HM-16.22 LDP" \
-  --detector-size 640 \
-  --detector-batch-size 16 \
-  --confidence-threshold 0.001 \
-  --nms-iou-threshold 0.6 \
-  --max-detections 300 \
-  --output-dir output/hevc_evaluation
+--chroma-format 420 --bit-depth 8
 ```
 
-The evaluator saves an automatic progress checkpoint after every completely
-evaluated sequence (encoding, decoding, and mAP). If a Colab session ends,
-repeat the identical command with `--resume`; at most the sequence active at
-the interruption is re-run. Keep `--output-dir`, `--bitstream-dir`, and
-`--encoder-log-dir` on Google Drive if the runtime itself may be reset.
+Pipeline này dùng BT.709 RGB full ↔ YUV420 limited. Width/height phải chẵn.
 
-For offline YOLOv5, add:
+## Chọn QP
 
-```bash
---yolov5-repo /path/to/yolov5-v7 \
---yolov5-weights /path/to/yolov5s.pt
-```
+HEVC không cần dùng cùng số QP với DCVC-RT; cần bốn rate points có vùng mAP giao
+nhau với candidate. Nếu `22/27/32/37` không overlap, chạy pilot rồi dịch cả dải.
+Không loại điểm dominated rồi vẫn báo BD-rate: bốn điểm đưa vào phải tạo Pareto
+front với bitrate và mAP tăng cùng nhau.
 
-The result JSON contains:
-
-- actual BPP and kbps;
-- mAP@0.5 and mAP@[0.5:0.95];
-- full stream bits and excluded seed bits per sequence;
-- exact evaluated frame count;
-- dataset fingerprint and detector configuration;
-- HM configuration and rate provenance.
-
-## Proposed-codec evaluation
-
-Run `evaluate_vcm.py --mode codec` on the same data and with the same detector
-arguments. Both result files must contain the same `evaluation_id`,
-`detector_config`, `ground_truth`, `protocol`, and evaluated frame count.
-
-## BD-rate comparison
-
-`compare_codecs_bd_rate.py` now rejects missing or mismatched fairness
-metadata. Video comparison defaults to kbps:
+## So sánh ba codec
 
 ```bash
 python compare_codecs_bd_rate.py \
-  --hevc-results output/hevc_evaluation/HEVC_HM-16.22_LDP_results.json \
-  --learned-scalable-results output/learned_scalable_results.json \
-  --proposed-results output/evaluation/dcvc_rt_vcm_results.json \
-  --rate kbps \
+  --hevc output/hevc_evaluation/hevc_hm_rgb444_results.json \
+  --learned-scalable results/learned_scalable_results.json \
+  --proposed output/evaluation/dcvc_rt_vcm_results.json \
+  --rate actual_bpp \
   --metrics map50 map5095 \
-  --output-dir output/codec_comparison
+  --output-dir output/comparison
 ```
 
-All four points must be Pareto-optimal and the curves must overlap in mAP.
-A negative proposed-versus-HEVC BD-rate means that the proposed codec uses
-less bitrate at equal machine-task accuracy.
+Script từ chối kết quả khác `evaluation_id`, detector config, ground truth,
+protocol hoặc evaluated-frame count. Mỗi JSON bắt buộc khai báo riêng
+`machine_frontend`: HEVC/DCVC-RT anchor dùng pretrained front end, còn candidate
+dùng cloned front end đã train. Đây là so sánh hệ thống VCM end-to-end, không
+phải cùng toàn bộ detector weights. BD-rate âm nghĩa là candidate dùng ít bit
+hơn anchor tại cùng mAP.

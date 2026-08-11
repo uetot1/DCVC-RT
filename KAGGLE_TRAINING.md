@@ -1,498 +1,291 @@
-# Huấn luyện DCVC-RT VCM từ đầu đến cuối trên Kaggle
+# Kaggle: train DCVC-RT VCM trên 2 GPU T4
 
-Hướng dẫn này dành cho pipeline video-only, machine-oriented:
+Đây là checklist vận hành cho bản final. Giải thích protocol và căn cứ khoa học
+nằm trong `README.md`.
 
-```text
-estimated BPP + multi-level YOLOv5 Feature MSE
-```
-
-Không train DMCI, không dùng RGB/YUV pixel MSE và không cần build entropy coder
-C++ trong quá trình train.
-
-## 1. Tạo các Kaggle Dataset đầu vào
-
-Gắn ít nhất hai dataset vào notebook.
-
-### Vimeo-90K Septuplet
+## 1. Input datasets
 
 ```text
-/kaggle/input/vimeo90k/
-└── vimeo_septuplet/
-    ├── sequences/
-    │   └── 00001/
-    │       └── 0001/
-    │           ├── im1.png
-    │           ├── ...
-    │           └── im7.png
-    ├── sep_trainlist.txt
-    └── sep_testlist.txt
-```
+/kaggle/input/vimeo90k/vimeo_septuplet/
+├── sequences/<id1>/<id2>/im1.png ... im7.png
+├── sep_trainlist.txt
+└── sep_testlist.txt
 
-### Checkpoint video DCVC-RT
-
-```text
 /kaggle/input/dcvc-rt-weights/
+├── cvpr2025_image.pth.tar
 └── cvpr2025_video.pth.tar
-```
 
-### Tùy chọn: YOLOv5 dùng offline
-
-Nếu notebook không được bật Internet, tạo thêm dataset:
-
-```text
 /kaggle/input/yolov5-v7-offline/
-├── yolov5/                 # checkout tag v7.0
-│   ├── hubconf.py
-│   ├── models/
-│   └── ...
+├── yolov5/                 # checkout đúng tag v7.0
 └── yolov5s.pt
 ```
 
-Stage 2 dùng REDS sharp sequences:
+Không đưa checkpoint vào GitHub ZIP.
 
-```text
-/kaggle/input/reds-dataset/
-└── REDS/
-    ├── train_sharp/
-    │   ├── 000/
-    │   │   ├── 00000000.png
-    │   │   └── ...
-    │   └── 239/
-    └── val_sharp/
-        ├── 000/
-        │   ├── 00000000.png
-        │   └── ...
-        └── 029/
-```
-
-Tải bản REDS đầy đủ gồm `train_sharp` và `val_sharp`, không dùng REDS4.
-Mỗi sequence REDS có 100 frame nên đáp ứng clip 8 frame của Stage 2.
-Nguồn tải và hướng dẫn cấu trúc:
-[REDS chính thức](https://seungjunnah.github.io/Datasets/reds.html) và
-[BasicSR Dataset Preparation](https://github.com/XPixelGroup/BasicSR/blob/master/docs/DatasetPreparation.md#reds).
-`reds-dataset` chỉ là slug minh họa; thay nó bằng slug Kaggle Dataset của bạn.
-
-## 2. Tạo notebook và bật GPU
-
-Trong Notebook Settings:
-
-1. Chọn GPU accelerator.
-2. Bật Internet nếu muốn Torch Hub tự tải YOLOv5 v7 và `yolov5s.pt`.
-3. Gắn các Kaggle Dataset ở bước 1.
-
-Kiểm tra GPU:
-
-```python
-import torch
-
-assert torch.cuda.is_available(), "Notebook chưa bật GPU"
-print("PyTorch:", torch.__version__)
-print("CUDA:", torch.version.cuda)
-print("GPU:", torch.cuda.get_device_name(0))
-print(
-    "VRAM MiB:",
-    torch.cuda.get_device_properties(0).total_memory / 2**20,
-)
-```
-
-## 3. Clone source mới nhất
+## 2. Clone/cài đặt
 
 ```bash
 %cd /kaggle/working
-!git clone https://github.com/uetot1/DCVC-RT.git
-%cd /kaggle/working/DCVC-RT
+!unzip -q /kaggle/input/dcvc-rt-vcm-source/DCVC-RT-VCM-final.zip
+%cd /kaggle/working/DCVC-RT-VCM-final
+!pip install -q tqdm scipy matplotlib pybind11 opencv-python-headless
 ```
 
-Kiểm tra commit:
-
-```bash
-!git log -1 --oneline
-```
-
-## 4. Cài dependency
-
-Kaggle đã có PyTorch/CUDA. Không nên cài lại PyTorch trừ khi phiên bản hiện tại
-bị lỗi. Chỉ cài các dependency còn thiếu:
-
-```bash
-!pip install -q \
-  tqdm scipy matplotlib pybind11 \
-  opencv-python-headless ultralytics
-```
-
-Kiểm tra import:
+Không cài lại `torch`/`torchvision` nếu Kaggle đã nhận đủ 2 GPU.
 
 ```python
-import cv2
-import numpy
-import scipy
-import tqdm
 import torch
-import torchvision
-
-print("dependency_check=PASS")
+assert torch.cuda.is_available()
+assert torch.cuda.device_count() == 2
+for index in range(torch.cuda.device_count()):
+    print(index, torch.cuda.get_device_name(index))
 ```
 
-## 5. Kiểm tra đường dẫn dữ liệu
+## 3. Khai báo đường dẫn một lần
 
 ```python
 from pathlib import Path
 
-VIMEO_ROOT = Path("/kaggle/input/vimeo90k/vimeo_septuplet")
-VIDEO_CKPT = Path(
-    "/kaggle/input/dcvc-rt-weights/cvpr2025_video.pth.tar"
-)
+VIMEO = Path("/kaggle/input/vimeo90k/vimeo_septuplet")
+IMAGE_CKPT = Path("/kaggle/input/dcvc-rt-weights/cvpr2025_image.pth.tar")
+VIDEO_CKPT = Path("/kaggle/input/dcvc-rt-weights/cvpr2025_video.pth.tar")
+YOLO_REPO = Path("/kaggle/input/yolov5-v7-offline/yolov5")
+YOLO_WEIGHTS = Path("/kaggle/input/yolov5-v7-offline/yolov5s.pt")
 
-assert (VIMEO_ROOT / "sequences").is_dir()
-assert (VIMEO_ROOT / "sep_trainlist.txt").is_file()
-assert (VIMEO_ROOT / "sep_testlist.txt").is_file()
-assert VIDEO_CKPT.is_file()
-
-first_id = (
-    (VIMEO_ROOT / "sep_trainlist.txt")
-    .read_text()
-    .splitlines()[0]
-    .strip()
-)
-first_sequence = VIMEO_ROOT / "sequences" / first_id
-print("First sequence:", first_sequence)
-print("Frames:", sorted(path.name for path in first_sequence.glob("*.png")))
+for path in (
+    VIMEO / "sequences",
+    VIMEO / "sep_trainlist.txt",
+    VIMEO / "sep_testlist.txt",
+    IMAGE_CKPT,
+    VIDEO_CKPT,
+    YOLO_REPO,
+    YOLO_WEIGHTS,
+):
+    assert path.exists(), path
 ```
 
-Kết quả phải có đúng `im1.png` đến `im7.png`.
-
-## 6. Chuẩn bị YOLOv5
-
-### Cách A — notebook có Internet
-
-Chạy một lần để cache repository và weights:
-
-```python
-import torch
-from src.models.yolov5_extractor import load_yolov5
-
-# Do not call torch.hub.load directly here. PyTorch >= 2.6 defaults
-# torch.load(weights_only=True), while the trusted YOLOv5 v7 checkpoint
-# contains the legacy models.yolo.Model object. The project loader applies
-# weights_only=False only while loading this pinned YOLOv5 checkpoint.
-model = load_yolov5("yolov5s")
-del model
-torch.cuda.empty_cache()
-print("YOLOv5 online cache=PASS")
-```
-
-Khi train không cần truyền `--yolov5-repo` hoặc `--yolov5-weights`.
-
-### Cách B — notebook offline
-
-Thêm vào mọi lệnh train:
+## 4. Validate dataset
 
 ```bash
---yolov5-repo /kaggle/input/yolov5-v7-offline/yolov5 \
---yolov5-weights /kaggle/input/yolov5-v7-offline/yolov5s.pt
+!python validate_dataset.py \
+  --root "$VIMEO/sequences" \
+  --list-file "$VIMEO/sep_trainlist.txt" \
+  --frames 7 --crop-size 256 --training
 ```
 
-Script chỉ load YOLO một lần rồi sao chép backbone. Teacher đóng băng; clone giữ
-BatchNorm ở eval nhưng trọng số được optimizer học chung với DMC. `latest.pt`,
-`best.pt` và `epoch_N.pt` đều lưu cloned front-end để evaluation dùng đúng mạng
-đã train.
+Nếu biến Python không được shell cell nhận, thay bằng đường dẫn đầy đủ. Chỉ tiếp
+tục khi output là `status: PASS`.
 
-## 7. Chạy smoke test trước
-
-Không bắt đầu train dài trước khi lệnh này hoàn thành:
+## 5. DDP smoke test
 
 ```bash
-!python train_vcm_final.py \
+!torchrun --standalone --nproc_per_node=2 train_vcm_final.py \
   --training-stage vimeo7 \
   --data-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
   --train-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_trainlist.txt \
   --val-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
   --val-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_testlist.txt \
+  --image-checkpoint /kaggle/input/dcvc-rt-weights/cvpr2025_image.pth.tar \
   --video-init /kaggle/input/dcvc-rt-weights/cvpr2025_video.pth.tar \
-  --checkpoint-dir /kaggle/working/checkpoints/smoke_vimeo7 \
+  --yolov5-repo /kaggle/input/yolov5-v7-offline/yolov5 \
+  --yolov5-weights /kaggle/input/yolov5-v7-offline/yolov5s.pt \
+  --checkpoint-dir /kaggle/working/checkpoints/smoke \
   --crop-size 128 \
-  --batch-size 1 \
-  --num-workers 2 \
   --epochs 1 \
-  --max-batches 5 \
+  --max-batches 4 \
   --max-validation-batches 2 \
   --validate-every 1 \
   --save-every 0
 ```
 
-Smoke test đạt khi:
-
-- Có 5 batch với loss/BPP hữu hạn.
-- `skipped_batches=0`.
-- Không CUDA OOM.
-- Có `latest.pt`, `best.pt` và CSV log.
-
 Kiểm tra:
 
 ```bash
-!find /kaggle/working/checkpoints/smoke_vimeo7 -maxdepth 2 -type f
+!find /kaggle/working/checkpoints/smoke -maxdepth 2 -type f -printf '%p\n'
 !nvidia-smi
 ```
 
-## 8. Stage 1 — Vimeo-90K machine adaptation
+Phải có `world_size=2`, `skipped=0`, `latest.pt`, `run_config.json`, CSV và
+JSONL. Training script tự khóa fused CUDA inference và in
+`autograd-safe PyTorch path`; đây là hành vi bắt buộc để gradient đúng.
 
-### Chạy toàn bộ dataset mỗi epoch
+## 6. Stress test 7 frame / crop 256
 
-Đây là cấu hình gần protocol dataset đầy đủ nhất, nhưng có thể quá dài cho một
-Kaggle session:
+Chạy cấu hình nặng nhất trước full run:
 
 ```bash
-!python train_vcm_final.py \
+!torchrun --standalone --nproc_per_node=2 train_vcm_final.py \
   --training-stage vimeo7 \
   --data-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
   --train-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_trainlist.txt \
-  --val-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
-  --val-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_testlist.txt \
+  --image-checkpoint /kaggle/input/dcvc-rt-weights/cvpr2025_image.pth.tar \
   --video-init /kaggle/input/dcvc-rt-weights/cvpr2025_video.pth.tar \
-  --checkpoint-dir /kaggle/working/checkpoints/vcm_vimeo7 \
-  --crop-size 128 \
-  --batch-size 1 \
-  --num-workers 2 \
-  --epochs 100 \
-  --validate-every 5 \
-  --validation-qps 0 21 42 63 \
-  --max-validation-batches 25 \
-  --save-every 10 \
-  --keep-periodic-checkpoints 2
+  --yolov5-repo /kaggle/input/yolov5-v7-offline/yolov5 \
+  --yolov5-weights /kaggle/input/yolov5-v7-offline/yolov5s.pt \
+  --checkpoint-dir /kaggle/working/checkpoints/stress_7f_256 \
+  --crop-size 256 --epochs 1 \
+  --vimeo-curriculum-frames 7 \
+  --vimeo-curriculum-start-epochs 1 \
+  --accumulation-steps 1 --tbptt-steps 0 \
+  --max-batches 2 --validate-every 99 --save-every 0
 ```
 
-### Cấu hình thực tế hơn cho quota Kaggle
-
-Giới hạn số update trong một epoch để mỗi epoch chắc chắn kết thúc và tạo
-`latest.pt`. DataLoader shuffle lại toàn bộ Vimeo-90K ở epoch tiếp theo:
+Chạy thêm test nhánh TBPTT (kể cả khi full-BPTT không OOM) để xác nhận DDP xử lý
+đúng parameter không dùng ở từng chunk:
 
 ```bash
-!python train_vcm_final.py \
+!torchrun --standalone --nproc_per_node=2 train_vcm_final.py \
   --training-stage vimeo7 \
   --data-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
   --train-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_trainlist.txt \
-  --val-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
-  --val-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_testlist.txt \
+  --image-checkpoint /kaggle/input/dcvc-rt-weights/cvpr2025_image.pth.tar \
   --video-init /kaggle/input/dcvc-rt-weights/cvpr2025_video.pth.tar \
-  --checkpoint-dir /kaggle/working/checkpoints/vcm_vimeo7 \
-  --crop-size 128 \
-  --batch-size 1 \
-  --num-workers 2 \
-  --epochs 100 \
-  --max-batches 1000 \
-  --validate-every 5 \
-  --validation-qps 0 21 42 63 \
-  --max-validation-batches 25 \
-  --save-every 10 \
-  --keep-periodic-checkpoints 2
+  --yolov5-repo /kaggle/input/yolov5-v7-offline/yolov5 \
+  --yolov5-weights /kaggle/input/yolov5-v7-offline/yolov5s.pt \
+  --checkpoint-dir /kaggle/working/checkpoints/stress_tbptt_7f \
+  --crop-size 128 --epochs 1 \
+  --vimeo-curriculum-frames 7 \
+  --vimeo-curriculum-start-epochs 1 \
+  --accumulation-steps 1 --tbptt-steps 2 \
+  --max-batches 3 --validate-every 99 --save-every 0
 ```
 
-`--max-batches 1000` là cấu hình vận hành cho Kaggle, không phải con số được
-paper công bố. Sau smoke test, đo thời gian 100 batch rồi điều chỉnh để một epoch
-hoàn thành an toàn trong session.
+`run_config.json` phải ghi `ddp_find_unused_parameters: true`. Với main
+`tbptt=0`, giá trị phải là `false`. Nếu 7-frame/crop-256 OOM, dùng
+`--tbptt-steps 2` cho final run.
 
-Curriculum mặc định:
+## 7. λ-scale pilot sweep
 
-```text
-epoch 1–5:    2 frame
-epoch 6–10:   3 frame
-epoch 11–20:  5 frame
-epoch 21+:    7 frame
-```
+Chạy ba job với `--lambda-scale 0.003`, `0.006`, `0.010`, mỗi job tối thiểu vài
+trăm batch (ví dụ `--max-batches 300`) và ghi vào checkpoint directory riêng.
+Không chạy song song ba job trên cùng hai GPU. So sánh:
 
-## 9. Resume Stage 1
+- `estimated_bpp`;
+- `feature_mse`;
+- `dmc_grad_norm` và `frontend_grad_norm`;
+- validation tại QP `0/21/42/63`;
+- không có non-finite/skipped batch.
 
-Nếu kernel vẫn giữ `/kaggle/working`:
+`0.006` là mặc định khởi tạo, không phải giá trị được paper công bố. Kết quả
+gradient cũ của layer `4/6/9` không đủ để chọn λ cho main topology `17/20/23`;
+pilot phải chạy lại sau thay đổi này.
+
+## 8. Final 15-epoch run
+
+Ví dụ sau giả định sweep đã chọn `0.006`. Main topology mặc định là feature
+layer `17 20 23` và cloned front end `0..4`; không cần truyền thêm cờ. Layer
+`4 6 9` chỉ dùng cho ablation riêng.
 
 ```bash
-!python train_vcm_final.py \
+!torchrun --standalone --nproc_per_node=2 train_vcm_final.py \
   --training-stage vimeo7 \
   --data-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
   --train-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_trainlist.txt \
   --val-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
   --val-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_testlist.txt \
-  --resume /kaggle/working/checkpoints/vcm_vimeo7/latest.pt \
+  --image-checkpoint /kaggle/input/dcvc-rt-weights/cvpr2025_image.pth.tar \
+  --video-init /kaggle/input/dcvc-rt-weights/cvpr2025_video.pth.tar \
+  --yolov5-repo /kaggle/input/yolov5-v7-offline/yolov5 \
+  --yolov5-weights /kaggle/input/yolov5-v7-offline/yolov5s.pt \
   --checkpoint-dir /kaggle/working/checkpoints/vcm_vimeo7 \
-  --crop-size 128 \
-  --batch-size 1 \
-  --num-workers 2 \
-  --epochs 100 \
-  --max-batches 1000
-```
-
-Nếu bắt đầu session mới:
-
-1. Save Version hoặc tạo Kaggle Dataset từ output session trước.
-2. Gắn output đó làm input cho notebook mới.
-3. Truyền đường dẫn input `latest.pt` vào `--resume`.
-4. Vẫn ghi checkpoint mới vào `/kaggle/working`.
-
-Ví dụ:
-
-```bash
---resume /kaggle/input/vcm-vimeo7-previous/vcm_vimeo7/latest.pt
-```
-
-Không truyền đồng thời `--resume` và `--video-init`.
-
-## 10. Chọn checkpoint Stage 1
-
-Sau khi hoàn thành:
-
-```text
-/kaggle/working/checkpoints/vcm_vimeo7/
-├── latest.pt
-├── best.pt
-├── epoch_*.pt             # tối đa hai snapshot mặc định
-└── logs/
-```
-
-- `latest.pt`: tiếp tục đúng optimizer, scheduler, curriculum và early stopping.
-- `best.pt`: dùng để khởi tạo Stage 2 hoặc evaluation.
-- `epoch_*.pt`: snapshot dự phòng.
-
-## 11. Stage 2 — fine-tune REDS sharp sequences
-
-Stage 2 luôn dùng 8 frame: 1 external seed + 7 P-frame.
-
-Kiểm tra REDS trước:
-
-```python
-from pathlib import Path
-
-REDS_ROOT = Path("/kaggle/input/reds-dataset/REDS")
-train_sequences = sorted(
-    path for path in (REDS_ROOT / "train_sharp").iterdir()
-    if path.is_dir()
-)
-val_sequences = sorted(
-    path for path in (REDS_ROOT / "val_sharp").iterdir()
-    if path.is_dir()
-)
-
-assert len(train_sequences) == 240
-assert len(val_sequences) == 30
-assert len(list(train_sequences[0].glob("*.png"))) == 100
-print("REDS check=PASS")
-```
-
-```bash
-!python train_vcm_final.py \
-  --training-stage reds8 \
-  --data-dir /kaggle/input/reds-dataset/REDS/train_sharp \
-  --val-dir /kaggle/input/reds-dataset/REDS/val_sharp \
-  --samples-per-sequence 8 \
-  --video-init /kaggle/working/checkpoints/vcm_vimeo7/best.pt \
-  --checkpoint-dir /kaggle/working/checkpoints/vcm_reds8 \
-  --crop-size 128 \
-  --batch-size 1 \
-  --num-workers 2 \
-  --epochs 100 \
-  --max-batches 1000 \
-  --validate-every 5 \
+  --epochs 15 \
+  --crop-size 256 \
+  --batch-size-per-gpu 1 \
+  --accumulation-steps 4 \
+  --tbptt-steps 0 \
+  --learning-rate 1e-5 \
+  --frontend-learning-rate 1e-6 \
+  --lambda-scale 0.006 \
+  --vimeo-curriculum-frames 3 5 7 \
+  --vimeo-curriculum-start-epochs 1 3 6 \
   --validation-qps 0 21 42 63 \
+  --validate-every 1 \
   --max-validation-batches 25 \
-  --save-every 10 \
-  --keep-periodic-checkpoints 2
+  --save-every 5 \
+  --keep-periodic-checkpoints 3
 ```
 
-Stage 2 resume:
+Nếu OOM tại epoch 6 khi bắt đầu bảy frame:
+
+1. thử `--tbptt-steps 2`;
+2. nếu vẫn OOM, dùng crop 128 cho thí nghiệm pilot;
+3. không giảm số frame final xuống dưới 7 mà vẫn ghi là seven-frame training.
+
+## 9. Resume đúng cách
 
 ```bash
-!python train_vcm_final.py \
-  --training-stage reds8 \
-  --data-dir /kaggle/input/reds-dataset/REDS/train_sharp \
-  --val-dir /kaggle/input/reds-dataset/REDS/val_sharp \
-  --samples-per-sequence 8 \
-  --resume /kaggle/working/checkpoints/vcm_reds8/latest.pt \
-  --checkpoint-dir /kaggle/working/checkpoints/vcm_reds8 \
-  --crop-size 128 \
-  --batch-size 1 \
-  --num-workers 2 \
-  --epochs 100 \
-  --max-batches 1000
+!torchrun --standalone --nproc_per_node=2 train_vcm_final.py \
+  --training-stage vimeo7 \
+  --data-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
+  --train-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_trainlist.txt \
+  --val-dir /kaggle/input/vimeo90k/vimeo_septuplet/sequences \
+  --val-list /kaggle/input/vimeo90k/vimeo_septuplet/sep_testlist.txt \
+  --image-checkpoint /kaggle/input/dcvc-rt-weights/cvpr2025_image.pth.tar \
+  --resume /kaggle/input/previous-output/vcm_vimeo7/latest.pt \
+  --yolov5-repo /kaggle/input/yolov5-v7-offline/yolov5 \
+  --yolov5-weights /kaggle/input/yolov5-v7-offline/yolov5s.pt \
+  --checkpoint-dir /kaggle/working/checkpoints/vcm_vimeo7 \
+  --epochs 15
 ```
 
-Không dùng `--resume` từ Stage 1 cho Stage 2. Chuyển stage phải dùng
-`--video-init .../vcm_vimeo7/best.pt`. Tên stage cũ `long8` vẫn được chấp nhận
-như alias để resume checkpoint cũ, nhưng run mới nên dùng `reds8`.
+Không truyền `--video-init` cùng `--resume`. Resume cần giữ nguyên feature
+layers, cloned-front-end topology, λ, curriculum, TBPTT và optimizer settings
+của run cũ. Checkpoint schema cũ dùng clone `0..9` không được resume vào bản này.
 
-Validation mặc định dùng bốn `QP_base = {0, 21, 42, 63}`. Mỗi validation clip
-được chạy bốn lần, nên `--max-validation-batches 25` tương ứng 100 lượt chạy
-codec. `best.pt` tối thiểu hóa mean validation loss của bốn rate point. Đây là
-estimated BPP + Feature MSE trên tập validation, không phải actual-bitstream mAP;
-mAP và BD-rate vẫn được đo riêng bằng `evaluate_vcm.py` sau khi train.
+## 10. Sau training
 
-Mặc định script dùng thiết kế lai Learned Scalable + TransTIC-inspired:
-
-```bash
---train-cloned-frontend \
---feature-layer-indices 4 6 9 \
---feature-layer-weights 1 1 1
-```
-
-Ba trọng số được chuẩn hóa thành `1/3`. Đây không phải bộ trọng số đã được paper
-chứng minh tối ưu cho YOLOv5; hãy giữ các periodic checkpoint và chọn bằng
-BD-rate–mAP trên validation set có nhãn. Không chọn bằng Class D test set.
-
-Checkpoint cũ không chứa clone không thể `--resume` vào optimizer mới. Có thể
-dùng checkpoint đó qua `--video-init`: DMC được kế thừa, còn clone khởi tạo từ
-YOLO pretrained rồi bắt đầu joint training.
-
-## 12. Xử lý CUDA OOM
-
-Thực hiện theo thứ tự:
-
-1. Giữ `--batch-size 1`.
-2. Giảm `--crop-size 128` xuống `96`.
-3. Nếu vẫn OOM, giảm xuống `64`.
-4. Đảm bảo crop size luôn chia hết cho 16.
-5. Không tăng `num_workers` để sửa OOM GPU; worker chỉ ảnh hưởng CPU/RAM.
-
-Không tự bật AMP cho rate path vì entropy likelihood và CDF có thể mất ổn định
-ở FP16.
-
-## 13. Theo dõi train
-
-```bash
-!nvidia-smi
-!ls -lh /kaggle/working/checkpoints/vcm_vimeo7
-!tail -n 5 /kaggle/working/checkpoints/vcm_vimeo7/logs/*.csv
-```
-
-Các dấu hiệu cần dừng:
-
-- Loss hoặc BPP liên tục tăng vô hạn.
-- `skipped_batches` tăng thường xuyên.
-- Validation Feature MSE không cải thiện qua nhiều lần kiểm tra.
-- GPU OOM lặp lại.
-
-Một batch NaN/Inf được bỏ qua và không cập nhật AdamW. Nếu tất cả batch trong
-epoch đều bị bỏ qua, script dừng với lỗi thay vì tạo checkpoint hỏng.
-
-## 14. Lưu kết quả trước khi kết thúc session
-
-Chỉ cần giữ:
+Giữ tối thiểu:
 
 ```text
 latest.pt
-best.pt
-hai epoch snapshot mới nhất
-logs/
+best_proxy.pt
+epoch_5.pt
+epoch_10.pt
+epoch_15.pt
+run_config.json
+logs/*.csv
+logs/*_batches.jsonl
+logs/*_training_curves.png
+logs/latest_training_history.csv
+logs/latest_training_curves.png
 ```
 
-Các file được ghi trong `/kaggle/working`, vì vậy hãy Save Version, tải xuống
-hoặc tạo Kaggle Dataset output trước khi xóa session.
+CSV được cập nhật sau mỗi epoch. PNG gồm ba đồ thị `total loss`, `estimated BPP`
+và `Feature MSE`, được vẽ một lần khi run kết thúc hoặc cleanup sau `Ctrl+C`/
+exception. Nếu resume từ checkpoint mới, CSV/PNG của run sau chứa lại cả lịch sử
+epoch trước đó vì lịch sử được lưu bên trong checkpoint.
 
-## 15. Sau khi train
+`best_proxy.pt` không tự động là checkpoint có BD-rate tốt nhất. Chạy actual
+BPP–mAP trên validation có nhãn cho `epoch_5/10/15`, rồi mới chọn checkpoint
+final. Sau đó Save Version/Save & Run All để output được giữ lại.
 
-Dùng `best.pt` của Stage 2 cho evaluation bốn rate point:
+Actual-bitstream evaluation mặc định phải giữ `--reset-interval 32` và
+`--codec-precision fp16`. Kết quả kiểm tra thêm
+`actual_to_estimated_bpp_ratio`; nếu lệch lớn/bất thường ở một QP thì chưa dùng
+đường đó để báo cáo BD-rate.
 
-```text
-actual BPP → mAP@0.5 / mAP@[0.5:0.95] → RD curve → BD-rate
+## 11. Long-sequence evaluation bắt buộc
+
+Main training vẫn kết thúc sau 15 epoch trên clip bảy frame. Không train thêm
+long sequence trước khi có bằng chứng drift. Sau training, chạy candidate và
+DCVC-RT anchor trên cùng tập sequence có ít nhất 100 frame:
+
+```bash
+!python evaluate_vcm.py --mode codec \
+  --data-dir /kaggle/input/vcm-long-eval \
+  --dataset-manifest /kaggle/input/vcm-long-eval/manifest.json \
+  --image-ckpt /kaggle/input/dcvc-rt-weights/cvpr2025_image.pth.tar \
+  --video-ckpt /kaggle/working/checkpoints/vcm_vimeo7/epoch_15.pt \
+  --yolov5-repo /kaggle/input/yolov5-v7-offline/yolov5 \
+  --yolov5-weights /kaggle/input/yolov5-v7-offline/yolov5s.pt \
+  --method-name dcvc_rt_vcm_epoch15 \
+  --qps 0 21 42 63 \
+  --reset-interval 32 \
+  --codec-precision fp16 \
+  --minimum-sequence-frames 100
 ```
 
-Evaluation bằng actual bitstream mới cần build `src/cpp`; training không cần.
-`evaluate_vcm.py` tự đọc cloned front-end từ checkpoint schema 8 và ghép nó với
-YOLO task back-end đóng băng. Nếu log báo fallback sang pretrained front-end thì
-đó là checkpoint legacy, chưa phải joint-trained Learned-Scalable-style model.
+JSON tự ghi BPP và mAP theo `frame_0`, `frames_1_7`, `frames_8_31`,
+`frames_32_63`, `frames_64_plus`. Chỉ fine-tune long sequence 1–3 epoch với LR
+thấp/TBPTT nếu candidate có BPP tăng hoặc mAP giảm theo frame index rõ hơn
+pretrained DCVC-RT anchor.

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import torch
 from tqdm import tqdm
 
 
@@ -106,12 +107,30 @@ def detector_config(
     return {
         "model": str(model_name),
         "weights_id": weights_id,
+        "weights_scope": "pretrained initialization and frozen task backend",
         "input_size": int(detector_size),
         "confidence_threshold": float(confidence_threshold),
         "nms_iou_threshold": float(nms_iou_threshold),
         "max_detections": int(max_detections),
         "feature_repository": "ultralytics/yolov5:v7.0",
     }
+
+
+def state_dict_sha256(state_dict: dict[str, torch.Tensor]) -> str:
+    """Fingerprint a model component independently of checkpoint packaging."""
+    digest = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(json.dumps(list(tensor.shape)).encode("ascii"))
+        digest.update(b"\0")
+        if tensor.numel():
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
 
 
 def dataset_summary(dataset, sequences=None) -> dict[str, int]:
