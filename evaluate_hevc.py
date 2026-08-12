@@ -230,6 +230,7 @@ def x265_encode(
 
 def x265_decode(
     ffmpeg: str,
+    sequence: VideoSequence,
     bitstream_path: Path,
     reconstructed_yuv: Path,
     bit_depth: int,
