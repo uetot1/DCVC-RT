@@ -1,20 +1,21 @@
-"""Evaluate an HEVC HM anchor with actual bitrate and object-detection mAP.
+"""Evaluate an HEVC x265 anchor with actual bitrate and object-detection mAP.
 
 This script is evaluation-only. It does not import or modify the VCM training
 loop. For each of four QPs it performs:
 
-RGB frames -> FFmpeg BT.709 YUV 4:4:4 10-bit -> HM -> FFmpeg RGB
+RGB frames -> FFmpeg BT.709 YUV 4:4:4 10-bit -> x265 -> FFmpeg RGB
 -> frozen YOLOv5 -> mAP.
 
-The default all-frame protocol counts the complete independently decodable HEVC
-bitstream and evaluates every frame, matching ``evaluate_vcm.py``. YUV 4:2:0 is
-still available for experiments whose original source domain is YUV420.
+The all-frame protocol counts the complete independently decodable HEVC
+bitstream and evaluates every frame, matching ``evaluate_vcm.py``. x265 is
+configured as Low-Delay P: one first I-frame, no B-frames, and all following
+frames are P-frames. YUV 4:2:0 is still available only for experiments whose
+original source domain is YUV420.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import shutil
@@ -31,7 +32,6 @@ from src.models.yolov5_extractor import load_yolov5
 from src.utils.detection_map import DetectionMAP
 from src.utils.evaluation_protocol import (
     ALL_FRAMES_PROTOCOL,
-    EXTERNAL_SEED_PROTOCOL,
     dataset_summary,
     detector_config,
     evaluation_id,
@@ -41,15 +41,7 @@ from src.utils.vcm_eval_dataset import AnnotatedVideoDataset, VideoSequence
 
 RATE_POINT_COUNT = 4
 PROGRESS_SCHEMA_VERSION = 1
-PROTOCOLS = {
-    "conditional-pframes": EXTERNAL_SEED_PROTOCOL,
-    "all-frames": ALL_FRAMES_PROTOCOL,
-}
-POC_BITS_PATTERN = re.compile(
-    r"\bPOC\s+(-?\d+)\b.*?\)\s+([0-9][0-9,]*)\s+bits\b",
-    flags=re.IGNORECASE,
-)
-POC_PROGRESS_PATTERN = re.compile(r"\bPOC\s+(-?\d+)\b", flags=re.IGNORECASE)
+PROTOCOL = ALL_FRAMES_PROTOCOL
 
 
 def safe_name(value: str) -> str:
@@ -85,6 +77,11 @@ def run_command(command: list[str], label: str) -> str:
     return completed.stdout
 
 
+def x265_version(encoder: str) -> str:
+    """Capture the encoder identity so a resumed/evaluated run is reproducible."""
+    return run_command([encoder, "--version"], "x265 version").strip()
+
+
 def ffconcat_quote(path: Path) -> str:
     return path.resolve().as_posix().replace("'", "'\\''")
 
@@ -104,6 +101,17 @@ def raw_frame_bytes(
     bytes_per_sample = 1 if bit_depth == 8 else 2
     samples_per_pixel = 3.0 if chroma_format == "444" else 1.5
     return int(width * height * samples_per_pixel * bytes_per_sample)
+
+
+def x265_profile(bit_depth: int, chroma_format: str) -> str:
+    """Return the explicit HEVC profile required by the raw input format."""
+    profiles = {
+        ("420", 8): "main",
+        ("420", 10): "main10",
+        ("444", 8): "main444-8",
+        ("444", 10): "main444-10",
+    }
+    return profiles[(chroma_format, bit_depth)]
 
 
 def rgb_to_yuv(
@@ -159,95 +167,110 @@ def rgb_to_yuv(
         )
 
 
-def hm_encode(
+def x265_encode(
     encoder: str,
-    config: Path,
     sequence: VideoSequence,
     input_yuv: Path,
-    reconstructed_yuv: Path,
     bitstream_path: Path,
     qp: int,
     bit_depth: int,
     chroma_format: str,
+    preset: str,
     extra_arguments: list[str],
-    progress: tqdm | None = None,
 ) -> str:
     rounded_fps = int(round(sequence.fps))
     if abs(sequence.fps - rounded_fps) > 1e-6:
         raise ValueError(
-            f"HM requires an integer frame rate; {sequence.name} uses {sequence.fps}"
+            f"x265 requires an integer frame rate; {sequence.name} uses {sequence.fps}"
         )
     bitstream_path.parent.mkdir(parents=True, exist_ok=True)
+    input_format = "i444" if chroma_format == "444" else "i420"
     command = [
         encoder,
-        "-c",
-        str(config),
-        f"--InputFile={input_yuv}",
-        f"--BitstreamFile={bitstream_path}",
-        f"--ReconFile={reconstructed_yuv}",
-        f"--SourceWidth={sequence.width}",
-        f"--SourceHeight={sequence.height}",
-        f"--FrameRate={rounded_fps}",
-        f"--FramesToBeEncoded={sequence.frame_count}",
-        "--FrameSkip=0",
-        f"--QP={qp}",
-        f"--InputBitDepth={bit_depth}",
-        f"--InternalBitDepth={bit_depth}",
-        f"--OutputBitDepth={bit_depth}",
-        f"--InputChromaFormat={chroma_format}",
-        f"--ChromaFormatIDC={chroma_format}",
+        "--input",
+        str(input_yuv),
+        "--input-res",
+        f"{sequence.width}x{sequence.height}",
+        "--fps",
+        str(rounded_fps),
+        "--frames",
+        str(sequence.frame_count),
+        "--input-csp",
+        input_format,
+        "--input-depth",
+        str(bit_depth),
+        "--output-depth",
+        str(bit_depth),
+        "--profile",
+        x265_profile(bit_depth, chroma_format),
+        "--qp",
+        str(qp),
+        "--preset",
+        preset,
+        # Low-Delay P: one first I-frame then P-frames only. Fixed GOP and
+        # scenecut disable source-dependent intra refreshes for reproducibility.
+        "--bframes",
+        "0",
+        "--keyint",
+        str(sequence.frame_count),
+        "--min-keyint",
+        str(sequence.frame_count),
+        "--scenecut",
+        "0",
+        "--no-open-gop",
+        "--repeat-headers",
+        "--log-level",
+        "warning",
         *extra_arguments,
+        "--output",
+        str(bitstream_path),
     ]
-    # ``subprocess.run`` only returns after HM has encoded the *entire*
-    # sequence.  HM emits one "POC n" line per coded picture, so consume its
-    # output incrementally and expose that information to the notebook.
-    # This is especially useful for the CPU-only HM reference encoder, for
-    # which a low-QP sequence can take many minutes.
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
-    output_lines: list[str] = []
-    latest_poc = -1
-    try:
-        assert process.stdout is not None
-        for line in process.stdout:
-            output_lines.append(line)
-            match = POC_PROGRESS_PATTERN.search(line)
-            if match:
-                latest_poc = int(match.group(1))
-                # Updating every picture makes the progress visible without
-                # flooding notebook output with HM's full log.
-                if progress is not None:
-                    progress.set_postfix_str(
-                        f"{sequence.name}: HM {latest_poc + 1}/"
-                        f"{sequence.frame_count} frames"
-                    )
-                    progress.refresh()
-        return_code = process.wait()
-    except BaseException:
-        process.terminate()
-        process.wait()
-        raise
+    return run_command(command, f"x265 encode for {sequence.name} at QP {qp}")
 
-    output = "".join(output_lines)
-    if return_code:
-        tail = "".join(output_lines[-40:])
+
+def x265_decode(
+    ffmpeg: str,
+    bitstream_path: Path,
+    reconstructed_yuv: Path,
+    bit_depth: int,
+    chroma_format: str,
+) -> None:
+    """Decode x265 elementary stream to raw YUV for the shared RGB/YOLO path."""
+    pixel_formats = {
+        ("420", 8): "yuv420p",
+        ("420", 10): "yuv420p10le",
+        ("444", 8): "yuv444p",
+        ("444", 10): "yuv444p10le",
+    }
+    run_command(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(bitstream_path),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            str(sequence.frame_count),
+            "-pix_fmt",
+            pixel_formats[(chroma_format, bit_depth)],
+            "-f",
+            "rawvideo",
+            "-y",
+            str(reconstructed_yuv),
+        ],
+        f"FFmpeg x265 decode for {bitstream_path.name}",
+    )
+    expected_size = raw_frame_bytes(
+        sequence.width, sequence.height, bit_depth, chroma_format
+    ) * sequence.frame_count
+    if reconstructed_yuv.stat().st_size != expected_size:
         raise RuntimeError(
-            f"HM encode for {sequence.name} at QP {qp} failed with exit code "
-            f"{return_code}.\nCommand: {subprocess.list2cmdline(command)}\n{tail}"
+            f"{sequence.name}: x265 decoder produced "
+            f"{reconstructed_yuv.stat().st_size} bytes; expected {expected_size}"
         )
-    if progress is not None:
-        progress.set_postfix_str(
-            f"{sequence.name}: HM completed ({sequence.frame_count} frames)"
-        )
-        progress.refresh()
-    return output
 
 
 def yuv_to_rgb_frames(
@@ -301,40 +324,6 @@ def yuv_to_rgb_frames(
             f"expected {sequence.frame_count}"
         )
     return frames
-
-
-def reported_picture_bits(encoder_log: str) -> dict[int, int]:
-    result = {}
-    for match in POC_BITS_PATTERN.finditer(encoder_log):
-        poc = int(match.group(1))
-        result[poc] = int(match.group(2).replace(",", ""))
-    return result
-
-
-def conditional_rate(
-    bitstream_path: Path,
-    encoder_log: str,
-    protocol_key: str,
-) -> tuple[int, int]:
-    full_bits = bitstream_path.stat().st_size * 8
-    if protocol_key == "all-frames":
-        return full_bits, 0
-
-    picture_bits = reported_picture_bits(encoder_log)
-    if 0 not in picture_bits:
-        raise RuntimeError(
-            "Could not parse HM's reported POC 0 bits. Conditional-P-frame "
-            "evaluation requires the standard per-picture HM log. Use "
-            "--protocol all-frames only if complete-stream comparison is intended."
-        )
-    excluded_seed_bits = picture_bits[0]
-    actual_bits = full_bits - excluded_seed_bits
-    if actual_bits <= 0:
-        raise RuntimeError(
-            f"Invalid conditional rate: full stream={full_bits} bits, "
-            f"POC0={excluded_seed_bits} bits"
-        )
-    return actual_bits, excluded_seed_bits
 
 
 def as_yolo_image(path: Path) -> np.ndarray:
@@ -439,7 +428,7 @@ def checkpoint_identity(
     args: argparse.Namespace,
     dataset: AnnotatedVideoDataset,
     sequences: list[VideoSequence],
-    config: Path,
+    encoder_version: str,
 ) -> dict:
     """Return the inputs that must agree before an evaluation can resume."""
     return {
@@ -449,11 +438,12 @@ def checkpoint_identity(
             progress_description="Preparing HEVC evaluation identity",
         ),
         "qps": list(args.qps),
-        "protocol": args.protocol,
+        "protocol": "all-frames",
         "bit_depth": args.bit_depth,
         "chroma_format": args.chroma_format,
-        "hm_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
-        "hm_extra_arg": list(args.hm_extra_arg),
+        "x265_preset": args.preset,
+        "x265_extra_arg": list(args.x265_extra_arg),
+        "x265_version": encoder_version,
         "task_model": args.task_model,
         "detector_size": args.detector_size,
         "confidence_threshold": args.confidence_threshold,
@@ -485,7 +475,7 @@ def load_progress_checkpoint(path: Path, identity: dict) -> dict:
     if state.get("identity") != identity:
         raise RuntimeError(
             "The HEVC progress checkpoint was made with a different dataset, "
-            "QP list, HM config, protocol, or detector configuration. "
+            "QP list, x265 configuration, or detector configuration. "
             "Choose a new --progress-checkpoint or restart without --resume."
         )
     return state
@@ -497,11 +487,10 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("YOLO mAP evaluation requires CUDA")
 
-    encoder = resolve_executable(args.hm_encoder, "HM encoder")
+    encoder = resolve_executable(args.x265_encoder, "x265 encoder")
     ffmpeg = resolve_executable(args.ffmpeg, "FFmpeg")
-    config = Path(args.hm_config).expanduser().resolve()
-    if not config.is_file():
-        raise FileNotFoundError(f"HM configuration not found: {config}")
+    encoder_version = x265_version(encoder)
+    print(f"x265 encoder: {encoder_version}")
 
     dataset = AnnotatedVideoDataset(args.data_dir, args.dataset_manifest)
     sequences = list(dataset)
@@ -534,7 +523,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
     if work_parent is not None:
         work_parent.mkdir(parents=True, exist_ok=True)
 
-    identity = checkpoint_identity(args, dataset, sequences, config)
+    identity = checkpoint_identity(args, dataset, sequences, encoder_version)
     progress_path = (
         Path(args.progress_checkpoint)
         if args.progress_checkpoint
@@ -557,7 +546,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
     completed_qps = {int(point["base_qp"]) for point in points}
     for qp in args.qps:
         if qp in completed_qps:
-            print(f"{args.method_name}: HM QP {qp} already complete; skipping")
+            print(f"{args.method_name}: x265 QP {qp} already complete; skipping")
             continue
 
         active = state.get("active")
@@ -591,7 +580,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
             pending_sequences,
             total=len(sequences),
             initial=len(completed_names),
-            desc=f"{args.method_name}: HM QP {qp}",
+            desc=f"{args.method_name}: x265 QP {qp}",
         )
         for sequence in progress:
             with tempfile.TemporaryDirectory(
@@ -606,7 +595,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                 bitstream_path = (
                     bitstream_root
                     / f"qp_{qp:02d}"
-                    / f"{safe_name(sequence.name)}.bin"
+                    / f"{safe_name(sequence.name)}.hevc"
                 )
 
                 write_concat_file(sequence, concat_path)
@@ -620,18 +609,18 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                     args.bit_depth,
                     args.chroma_format,
                 )
-                encoder_log = hm_encode(
+                progress.set_postfix_str(f"{sequence.name}: x265 encode")
+                progress.refresh()
+                encoder_log = x265_encode(
                     encoder,
-                    config,
                     sequence,
                     input_yuv,
-                    reconstructed_yuv,
                     bitstream_path,
                     qp,
                     args.bit_depth,
                     args.chroma_format,
-                    args.hm_extra_arg,
-                    progress,
+                    args.preset,
+                    args.x265_extra_arg,
                 )
                 log_path = (
                     log_root
@@ -641,8 +630,16 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_path.write_text(encoder_log, encoding="utf-8")
 
-                progress.set_postfix_str(f"{sequence.name}: YUV -> RGB")
+                progress.set_postfix_str(f"{sequence.name}: x265 decode -> RGB")
                 progress.refresh()
+                x265_decode(
+                    ffmpeg,
+                    sequence,
+                    bitstream_path,
+                    reconstructed_yuv,
+                    args.bit_depth,
+                    args.chroma_format,
+                )
                 reconstructed_frames = yuv_to_rgb_frames(
                     ffmpeg,
                     sequence,
@@ -659,7 +656,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                     reconstructed_frames,
                     args.detector_size,
                     next_image_id,
-                    args.protocol,
+                    "all-frames",
                     f"{args.method_name}: QP {qp} YOLO {sequence.name}",
                     args.detector_batch_size,
                 )
@@ -675,16 +672,9 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                         dirs_exist_ok=True,
                     )
 
-                actual_bits, excluded_seed_bits = conditional_rate(
-                    bitstream_path,
-                    encoder_log,
-                    args.protocol,
-                )
-                coded_frames = (
-                    sequence.frame_count
-                    if args.protocol == "all-frames"
-                    else sequence.frame_count - 1
-                )
+                actual_bits = bitstream_path.stat().st_size * 8
+                excluded_seed_bits = 0
+                coded_frames = sequence.frame_count
                 records.append(
                     {
                         "name": sequence.name,
@@ -729,15 +719,8 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
         state["active"] = None
         save_progress_checkpoint(progress_path, state)
 
-    protocol = PROTOCOLS[args.protocol]
-    rate_source = (
-        "complete HM bitstream bytes including headers"
-        if args.protocol == "all-frames"
-        else (
-            "complete HM bitstream bytes minus HM-reported POC0 picture bits; "
-            "sequence headers retained"
-        )
-    )
+    protocol = PROTOCOL
+    rate_source = "complete independently decodable x265 HEVC bitstream bytes including headers"
     detector_metadata = detector_config(
         args.task_model,
         args.detector_size,
@@ -747,14 +730,17 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
         args.yolov5_weights,
     )
     output = {
-        "schema_version": 5,
+        "schema_version": 7,
         "method": args.method_name,
-        "codec": "HEVC HM reference encoder",
+        "codec": "HEVC x265 reference encoder",
         "codec_config": {
             "encoder": encoder,
-            "configuration_file": str(config),
+            "encoder_version": encoder_version,
             "configuration_name": args.configuration_name,
             "qps": list(args.qps),
+            "preset": args.preset,
+            "profile": x265_profile(args.bit_depth, args.chroma_format),
+            "coding_structure": "Low-Delay P (one first I-frame, no B-frames)",
             "bit_depth": args.bit_depth,
             "chroma_format": "4:4:4" if args.chroma_format == "444" else "4:2:0",
             "color_conversion": (
@@ -762,7 +748,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                 if args.chroma_format == "444"
                 else "BT.709 RGB full <-> YUV420 limited"
             ),
-            "extra_arguments": list(args.hm_extra_arg),
+            "extra_arguments": list(args.x265_extra_arg),
         },
         "protocol": protocol,
         "comparison_scope": "end-to-end VCM system",
@@ -794,19 +780,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--dataset-manifest", required=True)
-    parser.add_argument("--hm-encoder", required=True)
-    parser.add_argument("--hm-config", required=True)
+    parser.add_argument(
+        "--x265-encoder",
+        default="x265",
+        help="Path to the x265 CLI executable, or an executable available on PATH",
+    )
     parser.add_argument(
         "--configuration-name",
-        default="HM Low-Delay RGB444 10-bit",
+        default="x265 HEVC Low-Delay P RGB444 10-bit",
         help="Descriptive name recorded in the result JSON",
     )
     parser.add_argument("--ffmpeg", default="ffmpeg")
-    parser.add_argument(
-        "--protocol",
-        choices=tuple(PROTOCOLS),
-        default="all-frames",
-    )
     parser.add_argument(
         "--qps",
         type=int,
@@ -822,12 +806,17 @@ def parse_args() -> argparse.Namespace:
         help="Use 444 for RGB/PNG sources; use 420 only for a YUV420-source protocol",
     )
     parser.add_argument(
-        "--hm-extra-arg",
+        "--preset",
+        default="medium",
+        help="x265 speed/compression preset, recorded in the result JSON",
+    )
+    parser.add_argument(
+        "--x265-extra-arg",
         action="append",
         default=[],
-        help="Repeat for each HM override, e.g. --hm-extra-arg=--IntraPeriod=-1",
+        help="Repeat for each additional x265 option, e.g. --x265-extra-arg=--aq-mode=0",
     )
-    parser.add_argument("--method-name", default="HEVC HM RGB444 10-bit")
+    parser.add_argument("--method-name", default="hevc_x265_ldp_rgb444_10bit")
     parser.add_argument("--max-sequences", type=int)
     parser.add_argument(
         "--resume",

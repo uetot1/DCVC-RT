@@ -1,76 +1,75 @@
-# HEVC HM anchor cho BPP–mAP/BD-rate
+# HEVC x265 anchor for BPP-mAP / BD-rate
 
-Anchor phải dùng đúng cùng sequence, frame count, ground truth, YOLO weights,
-input size, confidence/NMS thresholds và **all-frame protocol** với candidate.
+The HEVC anchor and DCVC-RT candidate must use the identical evaluation
+manifest, frame count, YOLO weights, detector size, confidence/NMS thresholds,
+and all-frame protocol.
 
-## Source PNG/RGB
+## RGB/PNG source
 
-Theo test condition của Microsoft DCVC, traditional codec nên dùng YUV444 10-bit
-khi source là RGB. Cần HM RExt configuration, ví dụ
-`encoder_lowdelay_main_rext.cfg`:
+For an RGB frame manifest, this evaluator uses a BT.709 full-range YUV444
+10-bit interchange. It encodes the source with `x265`, decodes the actual
+HEVC elementary stream, converts the reconstruction to RGB, and runs the
+frozen YOLO detector on every frame.
+
+`x265` is intentionally constrained to Low-Delay P:
+
+- one first I-frame;
+- no B-frames;
+- fixed GOP equal to the evaluated sequence length;
+- no scenecut intra refresh.
+
+This is a reproducible traditional-video anchor compatible with the causal
+DCVC-RT prediction structure. BPP counts the complete independently decodable
+HEVC bitstream, including the first I-frame and headers.
 
 ```bash
 python evaluate_hevc.py \
   --data-dir /data/vcm_eval \
   --dataset-manifest manifest.json \
-  --hm-encoder /opt/HM/bin/TAppEncoderStatic \
-  --hm-config /opt/HM/cfg/encoder_lowdelay_main_rext.cfg \
-  --configuration-name "HM Low-Delay RGB444 10-bit" \
-  --protocol all-frames \
+  --x265-encoder x265 \
+  --configuration-name "x265 HEVC Low-Delay P RGB444 10-bit" \
+  --preset medium \
   --chroma-format 444 \
   --bit-depth 10 \
   --qps 22 27 32 37 \
-  --hm-extra-arg=--IntraPeriod=-1 \
   --yolov5-repo /opt/yolov5 \
   --yolov5-weights /weights/yolov5s.pt \
-  --method-name hevc_hm_rgb444
+  --method-name hevc_x265_ldp_rgb444_10bit
 ```
 
-Pipeline:
-
-```text
-RGB PNG → BT.709 full-range YUV444 10-bit → HM → YUV444 → RGB → YOLO
-```
-
-HM bitstream được tính toàn bộ, bao gồm header và I-frame. mAP được tính trên
-mọi frame.
-
-## Source YUV420 thật
-
-Nếu test sequence gốc là YUV420, thiết lập chuẩn nhất là mã hóa trực tiếp file
-YUV420 gốc. Script hiện nhận frame manifest PNG để đồng bộ ground truth; chế độ
-`--chroma-format 420` chỉ hợp lệ khi các PNG được xác định rõ là representation
-của cùng source protocol. Không trộn kết quả RGB444 và YUV420 trong một phép
-BD-rate.
+The command needs an x265 build supporting the requested chroma format and
+bit depth (the evaluator requests `main444-10` by default). Check it before
+the long run:
 
 ```bash
---chroma-format 420 --bit-depth 8
+x265 --version
 ```
 
-Pipeline này dùng BT.709 RGB full ↔ YUV420 limited. Width/height phải chẵn.
+Use `--resume` after an interruption. The script checkpoints after every
+completed sequence, so already-completed sequences and QPs are not repeated.
 
-## Chọn QP
+## Source YUV420
 
-HEVC không cần dùng cùng số QP với DCVC-RT; cần bốn rate points có vùng mAP giao
-nhau với candidate. Nếu `22/27/32/37` không overlap, chạy pilot rồi dịch cả dải.
-Không loại điểm dominated rồi vẫn báo BD-rate: bốn điểm đưa vào phải tạo Pareto
-front với bitrate và mAP tăng cùng nhau.
+Use `--chroma-format 420 --bit-depth 8` only when the original evaluation
+source is truly YUV420. Do not mix a RGB444 result and a YUV420 result in one
+BD-rate calculation.
 
-## So sánh ba codec
+## Four QPs and comparison
+
+The QP values do not have to equal the DCVC-RT base QPs. They only need to
+produce four Pareto rate-mAP points with a meaningful mAP overlap with the
+candidate. If 22/27/32/37 do not overlap, run a short pilot and shift the
+whole range.
 
 ```bash
-python compare_codecs_bd_rate.py \
-  --hevc output/hevc_evaluation/hevc_hm_rgb444_results.json \
-  --learned-scalable results/learned_scalable_results.json \
-  --proposed output/evaluation/dcvc_rt_vcm_results.json \
+python evaluate_vcm.py --mode bdrate \
+  --anchor-results output/hevc_evaluation/hevc_x265_ldp_rgb444_10bit_results.json \
+  --candidate-results output/evaluation/dcvc_rt_vcm_results.json \
   --rate actual_bpp \
-  --metrics map50 map5095 \
-  --output-dir output/comparison
+  --metric map5095 \
+  --output-dir output/comparison_x265
 ```
 
-Script từ chối kết quả khác `evaluation_id`, detector config, ground truth,
-protocol hoặc evaluated-frame count. Mỗi JSON bắt buộc khai báo riêng
-`machine_frontend`: HEVC/DCVC-RT anchor dùng pretrained front end, còn candidate
-dùng cloned front end đã train. Đây là so sánh hệ thống VCM end-to-end, không
-phải cùng toàn bộ detector weights. BD-rate âm nghĩa là candidate dùng ít bit
-hơn anchor tại cùng mAP.
+Negative BD-rate means the DCVC-RT candidate uses fewer bits than x265 at the
+same mAP. The checker rejects results with different data, detector settings,
+or evaluated-frame counts.

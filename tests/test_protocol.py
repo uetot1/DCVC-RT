@@ -11,7 +11,7 @@ try:
 except ModuleNotFoundError as error:  # Local packaging environments may omit CUDA/PyTorch.
     raise unittest.SkipTest("PyTorch is required for model protocol tests") from error
 
-from evaluate_hevc import raw_frame_bytes
+from evaluate_hevc import raw_frame_bytes, x265_profile
 from evaluate_vcm import (
     container_bits_by_frame,
     temporal_bin_name,
@@ -43,6 +43,14 @@ class ColourTransformTests(unittest.TestCase):
     def test_three_channels_required(self):
         with self.assertRaises(ValueError):
             rgb2ycbcr(torch.rand(1, 1, 4, 4))
+
+
+class X265ProtocolTests(unittest.TestCase):
+    def test_x265_profile_matches_bit_depth_and_chroma(self):
+        self.assertEqual(x265_profile(8, "420"), "main")
+        self.assertEqual(x265_profile(10, "420"), "main10")
+        self.assertEqual(x265_profile(8, "444"), "main444-8")
+        self.assertEqual(x265_profile(10, "444"), "main444-10")
 
 
 class TrainingProtocolTests(unittest.TestCase):

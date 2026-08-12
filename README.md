@@ -368,12 +368,11 @@ all-frame bitstream, theo test condition Microsoft đề xuất cho RGB content:
 python evaluate_hevc.py \
   --data-dir /data/vcm_eval \
   --dataset-manifest manifest.json \
-  --hm-encoder /opt/HM/bin/TAppEncoderStatic \
-  --hm-config /opt/HM/cfg/encoder_lowdelay_main_rext.cfg \
-  --protocol all-frames \
+  --x265-encoder x265 \
+  --preset medium \
   --chroma-format 444 \
   --bit-depth 10 \
-  --hm-extra-arg=--IntraPeriod=-1
+  --qps 22 27 32 37
 ```
 
 Nếu nguồn chuẩn thực sự là YUV420, anchor truyền thống phải mã hóa YUV420 gốc;
@@ -403,7 +402,7 @@ src/models/vcm_system.py        color/DMCI/DMC/task orchestration
 src/models/vcm_loss.py          TransTIC-inspired multi-level feature loss
 src/utils/transforms.py         full-range BT.709 RGB↔YCbCr
 evaluate_vcm.py                 all-frame actual BPP/mAP/BD-rate
-evaluate_hevc.py                HM RGB444-10bit or YUV420 anchor
+evaluate_hevc.py                x265 HEVC Low-Delay P RGB444-10bit or YUV420 anchor
 compare_codecs_bd_rate.py       three-codec BD-rate comparison
 validate_dataset.py             preflight dataset validation
 ```
