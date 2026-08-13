@@ -3,7 +3,7 @@
 Training remains differentiable and uses ``DMC.forward_train``. This script is
 evaluation-only: frozen DMCI codes frame 0, DMC codes all P-frames, and actual
 sequence-container bytes include both. Reconstructed BT.709 YCbCr is converted
-to RGB before measuring detector mAP against real labels at four rate points.
+to RGB before measuring detector mAP against real labels at four or more rate points.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from src.utils.transforms import rgb2ycbcr, ycbcr2rgb
 
 
 QP_OFFSETS = (0, 8, 0, 4, 0, 4, 0, 4)
-RATE_POINT_COUNT = 4
+MIN_RATE_POINT_COUNT = 4
 TWO_ENTROPY_CODER_PIXEL_THRESHOLD = 1280 * 720
 TEMPORAL_BIN_ORDER = (
     "frame_0",
@@ -430,8 +430,8 @@ def temporal_diagnostics(
 
 
 def evaluate_codec(args: argparse.Namespace) -> None:
-    if len(args.qps) != RATE_POINT_COUNT or len(set(args.qps)) != RATE_POINT_COUNT:
-        raise ValueError("Exactly four distinct base QPs are required")
+    if len(args.qps) < MIN_RATE_POINT_COUNT or len(set(args.qps)) != len(args.qps):
+        raise ValueError("At least four distinct base QPs are required")
     if not torch.cuda.is_available():
         raise RuntimeError(
             "Actual DMC bitstream coding requires CUDA. Training with "
@@ -662,7 +662,7 @@ def evaluate_codec(args: argparse.Namespace) -> None:
         "protocol": ALL_FRAMES_PROTOCOL,
         "comparison_scope": "end-to-end VCM system",
         "rate_source": "actual sequence-container bytes including headers",
-        "rate_points": RATE_POINT_COUNT,
+        "rate_points": len(points),
         "task": "object_detection",
         "task_model": args.task_model,
         "ground_truth": "normalized YOLO labels from evaluation manifest",
@@ -682,8 +682,10 @@ def load_results(path: str | Path) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("schema_version") not in (6, 7):
         raise ValueError(f"{path} does not use all-frame evaluation schema v6/v7")
-    if len(data.get("points", [])) != RATE_POINT_COUNT:
-        raise ValueError(f"{path} must contain exactly four rate points")
+    if len(data.get("points", [])) < MIN_RATE_POINT_COUNT:
+        raise ValueError(
+            f"{path} must contain at least {MIN_RATE_POINT_COUNT} rate points"
+        )
     required_metadata = (
         "evaluation_id",
         "task_model",
@@ -896,10 +898,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--qps",
         type=int,
-        nargs=RATE_POINT_COUNT,
+        nargs="+",
         default=(0, 21, 42, 63),
         choices=range(64),
-        metavar=("QP1", "QP2", "QP3", "QP4"),
+        metavar="QP",
+        help="At least four distinct DCVC-RT base QPs; all supplied points are evaluated",
     )
     parser.add_argument("--cuda-index", type=int, default=0)
     parser.add_argument("--force-zero-thres", type=float)

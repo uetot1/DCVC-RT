@@ -1,7 +1,7 @@
 """Evaluate an HEVC x265 anchor with actual bitrate and object-detection mAP.
 
 This script is evaluation-only. It does not import or modify the VCM training
-loop. For each of four QPs it performs:
+loop. For each requested QP it performs:
 
 RGB frames -> FFmpeg BT.709 YUV 4:4:4 10-bit -> x265 -> FFmpeg RGB
 -> frozen YOLOv5 -> mAP.
@@ -39,7 +39,7 @@ from src.utils.evaluation_protocol import (
 from src.utils.vcm_eval_dataset import AnnotatedVideoDataset, VideoSequence
 
 
-RATE_POINT_COUNT = 4
+MIN_RATE_POINT_COUNT = 4
 PROGRESS_SCHEMA_VERSION = 1
 PROTOCOL = ALL_FRAMES_PROTOCOL
 
@@ -483,8 +483,8 @@ def load_progress_checkpoint(path: Path, identity: dict) -> dict:
 
 
 def evaluate_hevc(args: argparse.Namespace) -> None:
-    if len(set(args.qps)) != RATE_POINT_COUNT:
-        raise ValueError("Exactly four distinct HEVC QPs are required")
+    if len(args.qps) < MIN_RATE_POINT_COUNT or len(set(args.qps)) != len(args.qps):
+        raise ValueError("At least four distinct HEVC QPs are required")
     if not torch.cuda.is_available():
         raise RuntimeError("YOLO mAP evaluation requires CUDA")
 
@@ -754,7 +754,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
         "protocol": protocol,
         "comparison_scope": "end-to-end VCM system",
         "rate_source": rate_source,
-        "rate_points": RATE_POINT_COUNT,
+        "rate_points": len(points),
         "task": "object_detection",
         "task_model": args.task_model,
         "ground_truth": "normalized YOLO labels from evaluation manifest",
@@ -795,9 +795,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--qps",
         type=int,
-        nargs=RATE_POINT_COUNT,
+        nargs="+",
         default=(22, 27, 32, 37),
-        metavar=("QP1", "QP2", "QP3", "QP4"),
+        metavar="QP",
+        help="At least four distinct x265 QPs; all supplied points are evaluated",
     )
     parser.add_argument("--bit-depth", type=int, choices=(8, 10), default=10)
     parser.add_argument(

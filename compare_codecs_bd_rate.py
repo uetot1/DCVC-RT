@@ -1,6 +1,6 @@
 """Compare HEVC, Learned Scalable and the proposed codec using BD-rate-mAP.
 
-Each input JSON must contain exactly four rate points. It may be an evaluation
+Each input JSON must contain at least four rate points. It may be an evaluation
 schema produced by ``evaluate_vcm.py`` or a compact external-result file:
 
 {
@@ -40,7 +40,7 @@ from typing import Any
 import numpy as np
 
 
-RATE_POINT_COUNT = 4
+MIN_RATE_POINT_COUNT = 4
 METHOD_ORDER = ("hevc", "learned_scalable", "proposed")
 METHOD_TITLES = {
     "hevc": "HEVC",
@@ -146,9 +146,9 @@ def load_method_results(
             f"{missing_metadata}"
         )
     points = data.get("points")
-    if not isinstance(points, list) or len(points) != RATE_POINT_COUNT:
+    if not isinstance(points, list) or len(points) < MIN_RATE_POINT_COUNT:
         raise ValueError(
-            f"{result_path} must contain exactly {RATE_POINT_COUNT} entries in 'points'"
+            f"{result_path} must contain at least {MIN_RATE_POINT_COUNT} entries in 'points'"
         )
 
     normalized_points = []
@@ -396,7 +396,7 @@ def write_templates(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for method_key in METHOD_ORDER:
         points = []
-        for index in range(RATE_POINT_COUNT):
+        for index in range(MIN_RATE_POINT_COUNT):
             points.append(
                 {
                     "rate_label": f"R{index + 1}",

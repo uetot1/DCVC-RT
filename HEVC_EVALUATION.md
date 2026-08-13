@@ -54,12 +54,18 @@ Use `--chroma-format 420 --bit-depth 8` only when the original evaluation
 source is truly YUV420. Do not mix a RGB444 result and a YUV420 result in one
 BD-rate calculation.
 
-## Four QPs and comparison
+## Four or more QPs and comparison
 
 The QP values do not have to equal the DCVC-RT base QPs. They only need to
-produce four Pareto rate-mAP points with a meaningful mAP overlap with the
-candidate. If 22/27/32/37 do not overlap, run a short pilot and shift the
-whole range.
+produce at least four Pareto rate-mAP points with a meaningful mAP overlap
+with the candidate. Dense exploratory runs are supported, for example
+`--qps 29 33 37 41 45 50`. All Pareto-optimal points are used by the BD-rate
+calculation; the HEVC and candidate curves do not need the same point count.
+
+Changing the QP list changes the evaluation identity. Use a new
+`--progress-checkpoint` for a new list, and only add `--resume` when the QPs,
+dataset, x265 configuration, and detector configuration exactly match the
+saved progress file.
 
 ```bash
 python evaluate_vcm.py --mode bdrate \
