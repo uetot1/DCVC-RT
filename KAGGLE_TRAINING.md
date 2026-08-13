@@ -264,6 +264,34 @@ Actual-bitstream evaluation mặc định phải giữ `--reset-interval 32` và
 `actual_to_estimated_bpp_ratio`; nếu lệch lớn/bất thường ở một QP thì chưa dùng
 đường đó để báo cáo BD-rate.
 
+### Stage 2 MOT17: object-aware crop và checkpoint theo mAP
+
+Với MOT17, thêm các cờ sau vào lệnh `reds8`:
+
+```bash
+  --crop-size 256 \
+  --crop-mode auto \
+  --aware-crop-probability 0.8 \
+  --select-checkpoint-by-map \
+  --validation-samples-per-sequence 4 \
+  --map-detector-size 640 \
+  --map-confidence-threshold 0.001 \
+  --map-nms-iou-threshold 0.6 \
+  --map-max-detections 300
+```
+
+`auto` dùng `MOT17-xx-FRCNN/gt/gt.txt` để đưa người vào 80% crop; 20% còn lại
+vẫn random. Nếu sequence không có box annotation, `auto` chọn vùng biến đổi mạnh
+giữa frame đầu/cuối. Validation MOT17 crop deterministic quanh object lớn nhất
+và tạo `best_map.pt` theo mean mAP@[.5:.95] tại QP `0/21/42/63`. Với TAD chỉ có
+nhãn normal/abnormal, không bật `--select-checkpoint-by-map`; vẫn dùng
+`--crop-mode auto` để nhận motion-aware crop.
+
+Crop `384` giữ nhiều ngữ cảnh/object hơn nhưng cần VRAM cao hơn. Dùng
+`--crop-size 384 --batch-size-per-gpu 1 --accumulation-steps 2` nếu T4 chịu được;
+không đổi crop size giữa chừng khi `--resume`. Muốn chuyển từ run crop 256 sang
+384, khởi tạo run mới bằng `--video-init latest.pt`.
+
 ## 11. Long-sequence evaluation bắt buộc
 
 Main training vẫn kết thúc sau 15 epoch trên clip bảy frame. Không train thêm

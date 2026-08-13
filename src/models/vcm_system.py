@@ -68,6 +68,33 @@ class VideoVCMSystem(nn.Module):
     def detach_dpb(self) -> None:
         self.dmc.detach_dpb()
 
+    @torch.no_grad()
+    def reconstruct_gop(
+        self,
+        rgb_frames: torch.Tensor,
+        base_qp: int,
+    ) -> torch.Tensor:
+        """Reconstruct a validation GOP without computing the training loss."""
+        if rgb_frames.ndim != 5 or rgb_frames.shape[2] != 3:
+            raise ValueError("rgb_frames must have shape [B, T, 3, H, W]")
+        seed_ycbcr = rgb2ycbcr(rgb_frames[:, 0])
+        reconstructed_ycbcr = self.image_model.forward_reconstruction(
+            seed_ycbcr,
+            int(base_qp),
+        )
+        self.dmc.clear_dpb()
+        self.dmc.set_curr_poc(0)
+        self.dmc.add_ref_frame(feature=None, frame=reconstructed_ycbcr.detach())
+        reconstructions = [ycbcr2rgb(reconstructed_ycbcr)]
+        for frame_index in range(1, rgb_frames.shape[1]):
+            coding_qp = int(base_qp) + QP_OFFSETS[frame_index % len(QP_OFFSETS)]
+            reconstructed_ycbcr, _ = self.dmc.forward_train(
+                rgb2ycbcr(rgb_frames[:, frame_index]),
+                coding_qp,
+            )
+            reconstructions.append(ycbcr2rgb(reconstructed_ycbcr))
+        return torch.stack(reconstructions, dim=1)
+
     def forward(
         self,
         rgb_frames: torch.Tensor,

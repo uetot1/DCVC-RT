@@ -40,6 +40,7 @@ phải tái lập nguyên implementation TransTIC.
 | λ | log interpolation `1→768`, nhân `lambda_scale` |
 | QP validation/evaluation | `0,21,42,63` |
 | Dataset mặc định | Vimeo-90K septuplet, 7 frame/clip |
+| Stage-2 crop | 80% MOT object/motion-aware + 20% random (`--crop-mode auto`) |
 | Curriculum 15 epoch | `3→5→7` frame tại epoch `1,3,6` |
 | Optimizer | AdamW; DMC `1e-5`, clone `1e-6` |
 | Distributed | DDP + DistributedSampler + `no_sync`; TBPTT tự bật unused-parameter detection |

@@ -53,8 +53,11 @@ from src.models.yolov5_extractor import (
     DEFAULT_CLONED_FRONTEND_LAST_LAYER,
     DEFAULT_FEATURE_LAYER_INDICES,
     ddp_find_unused_parameters,
+    install_cloned_frontend,
+    load_yolov5,
 )
 from src.utils.dataset import VideoSequenceDataset
+from src.utils.detection_map import DetectionMAP
 
 
 DEFAULT_VALIDATION_QPS = (0, 21, 42, 63)
@@ -100,6 +103,7 @@ class TrainingSchedule:
 class RestoredState:
     start_epoch: int = 1
     best_proxy_score: float = float("inf")
+    best_map5095: float = float("-inf")
     optimizer_steps: int = 0
     epoch_history: tuple[dict[str, Any], ...] = ()
 
@@ -109,6 +113,8 @@ class ValidationResult:
     mean: dict[str, float]
     by_qp: dict[int, dict[str, float]]
     proxy_score: float
+    map50: float | None = None
+    map5095: float | None = None
 
 
 def get_schedule(stage: str) -> TrainingSchedule:
@@ -277,7 +283,14 @@ def make_loader(
         crop_size=args.crop_size,
         num_frames=get_schedule(args.training_stage).num_frames,
         training=training,
-        samples_per_sequence=args.samples_per_sequence if training else 1,
+        samples_per_sequence=(
+            args.samples_per_sequence
+            if training
+            else args.validation_samples_per_sequence
+        ),
+        crop_mode=args.crop_mode,
+        aware_crop_probability=args.aware_crop_probability,
+        return_targets=(not training and args.select_checkpoint_by_map),
     )
     sampler = (
         DistributedSampler(
@@ -450,11 +463,16 @@ def aggregate_entries(entries: list[dict[str, torch.Tensor]]) -> dict[str, float
 
 
 @torch.no_grad()
+def _as_yolo_image(tensor: torch.Tensor):
+    return tensor.detach().clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy()
+
+
 def validate(
     system: VideoVCMSystem,
     loader: DataLoader,
     args: argparse.Namespace,
     device: torch.device,
+    map_detector=None,
 ) -> ValidationResult:
     system.eval()
     full_frames = get_schedule(args.training_stage).num_frames
@@ -462,10 +480,23 @@ def validate(
     entries_by_qp: dict[int, list[dict[str, torch.Tensor]]] = {
         qp: [] for qp in args.validation_qps
     }
-    for batch_index, frames in enumerate(loader):
+    map_evaluators = (
+        {qp: DetectionMAP() for qp in args.validation_qps}
+        if map_detector is not None
+        else None
+    )
+    next_image_id = {qp: 0 for qp in args.validation_qps}
+    for batch_index, batch in enumerate(loader):
         if args.max_validation_batches is not None and batch_index >= args.max_validation_batches:
             break
-        frames = frames.to(device, non_blocking=True)
+        if isinstance(batch, dict):
+            frames = batch["frames"].to(device, non_blocking=True)
+            targets = batch["targets"]
+            has_annotations = bool(batch["has_annotations"].all())
+        else:
+            frames = batch.to(device, non_blocking=True)
+            targets = None
+            has_annotations = False
         for base_qp in args.validation_qps:
             lambda_feature = interpolate_lambda(
                 base_qp,
@@ -484,6 +515,28 @@ def validate(
             entries_by_qp[base_qp].append(
                 {key: value.detach().cpu() for key, value in metrics.items()}
             )
+            if map_detector is not None and has_annotations:
+                reconstructed = system.reconstruct_gop(frames, base_qp)
+                detections = map_detector(
+                    [
+                        _as_yolo_image(reconstructed[0, frame_index])
+                        for frame_index in range(reconstructed.shape[1])
+                    ],
+                    size=args.map_detector_size,
+                ).xyxy
+                for frame_index, prediction in enumerate(detections):
+                    target_boxes = targets[frame_index]["boxes"][0]
+                    target_classes = targets[frame_index]["classes"][0]
+                    prediction = prediction.detach().cpu()
+                    map_evaluators[base_qp].add(
+                        image_id=next_image_id[base_qp],
+                        predicted_boxes=prediction[:, :4],
+                        predicted_scores=prediction[:, 4],
+                        predicted_classes=prediction[:, 5].long(),
+                        target_boxes=target_boxes,
+                        target_classes=target_classes,
+                    )
+                    next_image_id[base_qp] += 1
     by_qp = {qp: aggregate_entries(entries) for qp, entries in entries_by_qp.items()}
     mean = {
         key: sum(metrics[key] for metrics in by_qp.values()) / len(by_qp)
@@ -493,7 +546,17 @@ def validate(
         VideoVCMSystem.selection_score(metrics) for metrics in by_qp.values()
     ) / len(by_qp)
     proxy_score = math.exp(mean_log_objective)
-    return ValidationResult(mean, by_qp, proxy_score)
+    map50 = map5095 = None
+    if map_evaluators is not None and all(evaluator.image_ids for evaluator in map_evaluators.values()):
+        map_metrics = {qp: evaluator.compute() for qp, evaluator in map_evaluators.items()}
+        map50 = sum(metrics["map50"] for metrics in map_metrics.values()) / len(map_metrics)
+        map5095 = sum(metrics["map5095"] for metrics in map_metrics.values()) / len(map_metrics)
+        for qp, metrics in map_metrics.items():
+            by_qp[qp]["map50"] = float(metrics["map50"])
+            by_qp[qp]["map5095"] = float(metrics["map5095"])
+        mean["map50"] = float(map50)
+        mean["map5095"] = float(map5095)
+    return ValidationResult(mean, by_qp, proxy_score, map50, map5095)
 
 
 class TrainingLogger:
@@ -534,6 +597,8 @@ class TrainingLogger:
             "dmc_learning_rate",
             "frontend_learning_rate",
             "proxy_score",
+            "validation_map50",
+            "validation_map5095",
             "grad_norm",
             "dmc_grad_norm",
             "frontend_grad_norm",
@@ -653,6 +718,8 @@ class TrainingLogger:
         validation: ValidationResult | None,
     ) -> None:
         row = dict(metadata)
+        row["validation_map50"] = validation.map50 if validation else None
+        row["validation_map5095"] = validation.map5095 if validation else None
         row.update({f"train_{key}": train_metrics.get(key) for key in self.metric_names})
         if validation is not None:
             row.update({f"val_{key}": validation.mean.get(key) for key in self.metric_names})
@@ -714,12 +781,13 @@ def save_checkpoint(
     train_metrics: dict[str, float],
     validation: ValidationResult | None,
     best_proxy_score: float,
+    best_map5095: float,
     optimizer_steps: int,
     rng_states: list[dict[str, Any]],
     epoch_history: list[dict[str, Any]],
 ) -> None:
     payload = {
-        "schema_version": 12,
+        "schema_version": 13,
         "epoch": epoch,
         "training_stage": args.training_stage,
         "dmc_state_dict": system.dmc.state_dict(),
@@ -728,6 +796,7 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict(),
         "optimizer_steps": optimizer_steps,
         "best_proxy_score": best_proxy_score,
+        "best_map5095": best_map5095,
         "train_metrics": train_metrics,
         "validation_metrics": validation.mean if validation else None,
         "validation_metrics_by_qp": validation.by_qp if validation else None,
@@ -747,6 +816,15 @@ def save_checkpoint(
             "lambda_max": args.lambda_max,
             "lambda_scale": args.lambda_scale,
             "validation_qps": tuple(args.validation_qps),
+            "crop_size": args.crop_size,
+            "crop_mode": args.crop_mode,
+            "aware_crop_probability": args.aware_crop_probability,
+            "select_checkpoint_by_map": args.select_checkpoint_by_map,
+            "validation_samples_per_sequence": args.validation_samples_per_sequence,
+            "map_detector_size": args.map_detector_size,
+            "map_confidence_threshold": args.map_confidence_threshold,
+            "map_nms_iou_threshold": args.map_nms_iou_threshold,
+            "map_max_detections": args.map_max_detections,
             "tbptt_steps": args.tbptt_steps,
             "vimeo_curriculum_frames": tuple(args.vimeo_curriculum_frames),
             "vimeo_curriculum_start_epochs": tuple(
@@ -810,8 +888,19 @@ def restore_training(
     # Keep serialized RNG byte tensors on CPU; module/optimizer loaders move
     # parameter state to the appropriate device.
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint.get("schema_version") != 12:
-        raise ValueError("Only schema-12 checkpoints can be resumed; use --video-init otherwise")
+    schema_version = checkpoint.get("schema_version")
+    if schema_version not in (12, 13):
+        raise ValueError(
+            "Only schema-12/13 checkpoints can be resumed; use --video-init otherwise"
+        )
+    if schema_version == 12 and (
+        args.crop_mode != "random" or args.select_checkpoint_by_map
+    ):
+        raise ValueError(
+            "Schema-12 used random crops and proxy checkpoint selection. Start the "
+            "new object-aware/mAP protocol with --video-init <old-checkpoint>; "
+            "do not use --resume."
+        )
     if checkpoint.get("training_stage") != args.training_stage:
         raise ValueError("Resume checkpoint training stage does not match --training-stage")
     saved_protocol = checkpoint.get("protocol", {})
@@ -825,6 +914,15 @@ def restore_training(
         "vimeo_curriculum_start_epochs": tuple(
             args.vimeo_curriculum_start_epochs
         ),
+        "crop_size": args.crop_size,
+        "crop_mode": args.crop_mode,
+        "aware_crop_probability": args.aware_crop_probability,
+        "select_checkpoint_by_map": args.select_checkpoint_by_map,
+        "validation_samples_per_sequence": args.validation_samples_per_sequence,
+        "map_detector_size": args.map_detector_size,
+        "map_confidence_threshold": args.map_confidence_threshold,
+        "map_nms_iou_threshold": args.map_nms_iou_threshold,
+        "map_max_detections": args.map_max_detections,
     }
     for key, expected in expected_protocol.items():
         saved = saved_protocol.get(key)
@@ -882,6 +980,7 @@ def restore_training(
     return RestoredState(
         start_epoch=int(checkpoint["epoch"]) + 1,
         best_proxy_score=float(checkpoint.get("best_proxy_score", float("inf"))),
+        best_map5095=float(checkpoint.get("best_map5095", float("-inf"))),
         optimizer_steps=int(checkpoint.get("optimizer_steps", 0)),
         epoch_history=tuple(checkpoint.get("epoch_history", ())),
     )
@@ -914,6 +1013,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Image checkpoint not found: {args.image_checkpoint}")
     if args.crop_size % 16:
         raise ValueError("crop_size must be divisible by 16")
+    if args.crop_size < 128:
+        raise ValueError("crop_size must be at least 128")
+    if not 0.0 <= args.aware_crop_probability <= 1.0:
+        raise ValueError("aware_crop_probability must be in [0, 1]")
+    if args.validation_samples_per_sequence < 1:
+        raise ValueError("validation_samples_per_sequence must be positive")
+    if args.map_detector_size < 32 or args.map_detector_size % 32:
+        raise ValueError("map_detector_size must be a positive multiple of 32")
+    if not 0.0 <= args.map_confidence_threshold <= 1.0:
+        raise ValueError("map_confidence_threshold must be in [0, 1]")
+    if not 0.0 < args.map_nms_iou_threshold <= 1.0:
+        raise ValueError("map_nms_iou_threshold must be in (0, 1]")
+    if args.map_max_detections < 1:
+        raise ValueError("map_max_detections must be positive")
     if args.batch_size_per_gpu != 1:
         raise ValueError("DCVC-RT sequence training currently requires batch_size_per_gpu=1")
     if args.accumulation_steps < 1 or args.tbptt_steps < 0:
@@ -1019,6 +1132,28 @@ def run_training(args: argparse.Namespace) -> None:
         else:
             model = system
 
+        map_detector = None
+        if context.is_main and args.select_checkpoint_by_map:
+            if (
+                validation_loader is None
+                or not validation_loader.dataset.has_complete_object_annotations
+            ):
+                raise ValueError(
+                    "--select-checkpoint-by-map requires every validation sequence "
+                    "to have MOT annotations at <sequence>/../gt/gt.txt; do not use "
+                    "the unlabeled MOT17 test split for validation mAP"
+                )
+            map_detector = load_yolov5(
+                args.task_model,
+                repository=args.yolov5_repo,
+                weights=args.yolov5_weights,
+            ).to(context.device).eval()
+            map_detector.conf = args.map_confidence_threshold
+            map_detector.iou = args.map_nms_iou_threshold
+            map_detector.max_det = args.map_max_detections
+            for parameter in map_detector.parameters():
+                parameter.requires_grad_(False)
+
         checkpoint_dir = Path(args.checkpoint_dir)
         if context.is_main:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1066,6 +1201,7 @@ def run_training(args: argparse.Namespace) -> None:
             )
 
         best_proxy_score = restored.best_proxy_score
+        best_map5095 = restored.best_map5095
         optimizer_steps = restored.optimizer_steps
         latest_path = checkpoint_dir / "latest.pt"
         for epoch in range(restored.start_epoch, args.epochs + 1):
@@ -1198,7 +1334,19 @@ def run_training(args: argparse.Namespace) -> None:
                 and (epoch % args.validate_every == 0 or epoch == args.epochs)
             )
             if context.is_main and should_validate:
-                validation = validate(system, validation_loader, args, context.device)
+                if map_detector is not None:
+                    install_cloned_frontend(
+                        map_detector,
+                        system.objective.cloned_frontend_state_dict(),
+                        system.objective.cloned_frontend_last_layer,
+                    )
+                validation = validate(
+                    system,
+                    validation_loader,
+                    args,
+                    context.device,
+                    map_detector=map_detector,
+                )
             if context.enabled:
                 dist.barrier()
 
@@ -1225,6 +1373,13 @@ def run_training(args: argparse.Namespace) -> None:
                 improved = validation is not None and proxy_score < best_proxy_score
                 if improved:
                     best_proxy_score = proxy_score
+                improved_map = (
+                    validation is not None
+                    and validation.map5095 is not None
+                    and validation.map5095 > best_map5095
+                )
+                if improved_map:
+                    best_map5095 = float(validation.map5095)
                 peak_memory = (
                     torch.cuda.max_memory_allocated(context.device) / 2**20
                     if context.device.type == "cuda"
@@ -1262,12 +1417,15 @@ def run_training(args: argparse.Namespace) -> None:
                     train_metrics,
                     validation,
                     best_proxy_score,
+                    best_map5095,
                     optimizer_steps,
                     rng_states,
                     logger.history,
                 )
                 if improved:
                     copy_checkpoint(latest_path, checkpoint_dir / "best_proxy.pt")
+                if improved_map:
+                    copy_checkpoint(latest_path, checkpoint_dir / "best_map.pt")
                 if args.save_every and epoch % args.save_every == 0:
                     copy_checkpoint(latest_path, checkpoint_dir / f"epoch_{epoch}.pt")
                     prune_periodic_checkpoints(checkpoint_dir, args.keep_periodic_checkpoints)
@@ -1276,14 +1434,17 @@ def run_training(args: argparse.Namespace) -> None:
                     f"bpp={train_metrics['estimated_bpp']:.6f}, "
                     f"feature={train_metrics['feature_mse']:.6f}, "
                     f"rgb_psnr={train_metrics['rgb_psnr']:.3f}, "
-                    f"proxy={proxy_score:.6f}, skipped={skipped_total}"
+                    f"proxy={proxy_score:.6f}, "
+                    f"map5095={validation.map5095 if validation else None}, "
+                    f"skipped={skipped_total}"
                 )
                 if validation is not None:
                     for qp, metrics in validation.by_qp.items():
                         print(
                             f"  val qp={qp}: bpp={metrics['estimated_bpp']:.6f}, "
                             f"feature={metrics['feature_mse']:.6f}, "
-                            f"rgb_psnr={metrics['rgb_psnr']:.3f}"
+                            f"rgb_psnr={metrics['rgb_psnr']:.3f}, "
+                            f"map5095={metrics.get('map5095')}"
                         )
                 if context.device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(context.device)
@@ -1325,6 +1486,21 @@ def parse_args() -> argparse.Namespace:
         help="0 keeps the complete temporal graph; use 2 or 3 only if memory requires truncation",
     )
     parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument(
+        "--crop-mode",
+        choices=("random", "auto", "object", "motion"),
+        default="random",
+        help=(
+            "Stage-2 recommendation: auto uses MOT GT boxes when available, "
+            "otherwise temporal-motion crops"
+        ),
+    )
+    parser.add_argument(
+        "--aware-crop-probability",
+        type=float,
+        default=0.8,
+        help="Fraction of training samples using object/motion-aware crop",
+    )
     parser.add_argument("--samples-per-sequence", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -1365,6 +1541,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--max-validation-batches", type=int, default=25)
+    parser.add_argument(
+        "--validation-samples-per-sequence",
+        type=int,
+        default=4,
+        help="Deterministic clips spread from start to end of each validation video",
+    )
+    parser.add_argument(
+        "--select-checkpoint-by-map",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Create best_map.pt from mean validation mAP@[.5:.95] over four QPs",
+    )
+    parser.add_argument("--map-detector-size", type=int, default=640)
+    parser.add_argument("--map-confidence-threshold", type=float, default=0.001)
+    parser.add_argument("--map-nms-iou-threshold", type=float, default=0.6)
+    parser.add_argument("--map-max-detections", type=int, default=300)
     parser.add_argument("--max-batches", type=int)
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--keep-periodic-checkpoints", type=int, default=3)
